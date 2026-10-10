@@ -5,6 +5,7 @@ import math
 import os
 import pathlib
 import random
+import re
 import sys
 
 import torch
@@ -51,15 +52,22 @@ except ImportError:
     _CHECKPOINT_DIR = pathlib.Path("checkpoints")
 
 
-def _strategy_file_for_symbol(symbol: str | None) -> str:
-    """返回该品种对应的策略文件路径。
+_TF_NAME_RE = re.compile(r"[A-Za-z0-9]{1,4}")
 
-    单品种训练时使用 strategies/best_{symbol}.json，
-    多品种/未指定品种时回退到默认路径。
+
+def _strategy_file_for_symbol(symbol: str | None, timeframe: str | None) -> str | None:
+    """返回该品种对应的策略文件路径 best_{symbol}_{tf}.json。
+
+    Part A 命名规则（与 web/strategy_file.py 字符串层面一致，不 import web 层）：
+    symbol 与 timeframe 均有效才返回路径；timeframe 缺失或非法
+    （不匹配 [A-Za-z0-9]{1,4}）时返回 None，调用方跳过落盘并告警，不回退旧命名。
     """
-    if symbol:
-        return str(pathlib.Path("strategies") / f"best_{symbol}.json")
-    return _STRATEGY_FILE
+    if not symbol:
+        return None
+    tf = timeframe.strip() if isinstance(timeframe, str) else ""
+    if not tf or not _TF_NAME_RE.fullmatch(tf):
+        return None
+    return str(pathlib.Path("strategies") / f"best_{symbol}_{tf}.json")
 
 
 def _fallback_data_file_for_symbol(symbol: str) -> tuple[str | None, str | None]:
@@ -1037,16 +1045,21 @@ class AlphaEngine:
 
             if self.best_formula is not None:
                 from .vocab import VOCAB_VERSION
-                strategy_data = {
-                    "vocab_version": VOCAB_VERSION,
-                    "symbol": self.target_symbol,
-                    "formula": self.best_formula,
-                    "best_score": self.best_score,
-                }
-                save_path = _strategy_file_for_symbol(self.target_symbol)
-                pathlib.Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-                with open(save_path, "w") as fp:
-                    json.dump(strategy_data, fp, indent=2)
+                tf = self._resolve_strategy_timeframe()
+                save_path = _strategy_file_for_symbol(self.target_symbol, tf)
+                if save_path is None:
+                    tqdm.write("[engine] 无法确定周期，跳过 best_ 策略落盘（checkpoint 不受影响）")
+                else:
+                    strategy_data = {
+                        "vocab_version": VOCAB_VERSION,
+                        "symbol": self.target_symbol,
+                        "timeframe": tf,
+                        "formula": self.best_formula,
+                        "best_score": self.best_score,
+                    }
+                    pathlib.Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+                    with open(save_path, "w") as fp:
+                        json.dump(strategy_data, fp, indent=2)
 
             self._save_training_history_live()
 
@@ -1155,21 +1168,27 @@ class AlphaEngine:
         # ── End of training ──────────────────────────────────────────
         # 仅当跑满最终步时才保存最终 strategy 和历史
         if end_step == ModelConfig.TRAIN_STEPS:
+            save_path = None
             if self.best_formula is not None:
                 from .vocab import VOCAB_VERSION
-                strategy_data = {
-                    "vocab_version": VOCAB_VERSION,
-                    "symbol": self.target_symbol,
-                    "formula": self.best_formula,
-                    "best_score": self.best_score,
-                }
-                save_path = _strategy_file_for_symbol(self.target_symbol)
-                pathlib.Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-                # P1-3: 原子写入
-                tmp_path = save_path + ".tmp"
-                with open(tmp_path, "w", encoding="utf-8") as fp:
-                    json.dump(strategy_data, fp, indent=2, ensure_ascii=False)
-                os.replace(tmp_path, save_path)
+                tf = self._resolve_strategy_timeframe()
+                save_path = _strategy_file_for_symbol(self.target_symbol, tf)
+                if save_path is None:
+                    print("[engine] 无法确定周期，跳过 best_ 策略落盘（checkpoint 不受影响）")
+                else:
+                    strategy_data = {
+                        "vocab_version": VOCAB_VERSION,
+                        "symbol": self.target_symbol,
+                        "timeframe": tf,
+                        "formula": self.best_formula,
+                        "best_score": self.best_score,
+                    }
+                    pathlib.Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+                    # P1-3: 原子写入
+                    tmp_path = save_path + ".tmp"
+                    with open(tmp_path, "w", encoding="utf-8") as fp:
+                        json.dump(strategy_data, fp, indent=2, ensure_ascii=False)
+                    os.replace(tmp_path, save_path)
 
             sym_tag = f"[{self.target_symbol}] " if self.target_symbol else ""
             self.training_history.pop('_low_entropy_streak', None)
@@ -1192,7 +1211,8 @@ class AlphaEngine:
             print(f"  自适应噪声   : 启用={ModelConfig.ADAPTIVE_NOISE}，范围=[{ModelConfig.NOISE_MIN}, {ModelConfig.NOISE_MAX}]")
             print(f"  部分层重置   : 启用={ModelConfig.PARTIAL_RESET}，层={ModelConfig.PARTIAL_RESET_LAYERS}")
             print(f"  重启次数     : {self._restart_count}")
-            print(f"  策略已保存   : {save_path}")
+            if save_path:
+                print(f"  策略已保存   : {save_path}")
 
 
     # ── 实时保存最优公式（防进程意外退出丢失）────────────────────────────────
@@ -1222,6 +1242,23 @@ class AlphaEngine:
             except Exception:
                 pass
 
+    # ── 周期解析（best_ 文件名的 tf 部分）────────────────────────────────────
+    def _resolve_strategy_timeframe(self) -> str | None:
+        """解析落盘用周期：引擎 timeframe 属性 → web_settings.json 数据文件元数据。
+
+        解析失败返回 None，由调用方跳过 best_ 落盘并告警（不回退旧命名）。
+        数据文件元数据回退结果按品种缓存，避免每步重复读文件。
+        """
+        tf = getattr(self, "timeframe", None)
+        if tf:
+            return tf
+        if not self.target_symbol:
+            return None
+        if not hasattr(self, "_strategy_tf_cache"):
+            _data_file, tf_fb = _fallback_data_file_for_symbol(self.target_symbol)
+            self._strategy_tf_cache = tf_fb
+        return self._strategy_tf_cache
+
     def _save_strategy_live(self) -> None:
         """每次 best_formula 更新时立即保存 strategy json。
         即使训练中途进程被杀（OOM/终端回收/Ctrl+C），也能保留最新最优公式。
@@ -1233,7 +1270,11 @@ class AlphaEngine:
             return
         try:
             from .vocab import VOCAB_VERSION
-            save_path = _strategy_file_for_symbol(self.target_symbol)
+            tf = self._resolve_strategy_timeframe()
+            save_path = _strategy_file_for_symbol(self.target_symbol, tf)
+            if save_path is None:
+                tqdm.write("[engine] 无法确定周期，跳过 best_ 策略落盘（checkpoint 不受影响）")
+                return
             pathlib.Path(save_path).parent.mkdir(parents=True, exist_ok=True)
 
             existing: dict = {}
@@ -1249,23 +1290,22 @@ class AlphaEngine:
             strategy_data = {
                 "vocab_version": VOCAB_VERSION,
                 "symbol": self.target_symbol,
+                "timeframe": tf,
                 "formula": self.best_formula,
                 "best_score": self.best_score,
                 "formula_decoded": self._decode_formula(self.best_formula),
             }
             # 保留训练数据路径等元数据，避免 live 保存把 data_file 冲掉
-            for key in ("timeframe", "data_file", "mode", "train_steps"):
+            for key in ("data_file", "mode", "train_steps"):
                 val = getattr(self, key, None)
                 if val is None:
                     val = existing.get(key)
                 if val is not None:
                     strategy_data[key] = val
             if not strategy_data.get("data_file") and self.target_symbol:
-                data_file, tf = _fallback_data_file_for_symbol(self.target_symbol)
+                data_file, _tf_fb = _fallback_data_file_for_symbol(self.target_symbol)
                 if data_file:
                     strategy_data["data_file"] = data_file
-                if tf and not strategy_data.get("timeframe"):
-                    strategy_data["timeframe"] = tf
                 if data_file and not strategy_data.get("mode"):
                     strategy_data["mode"] = "parquet_file"
 
