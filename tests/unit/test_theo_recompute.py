@@ -74,12 +74,15 @@ def test_identity_recompute_matches_live_formula(tmp_path, monkeypatch):
 
 
 def test_state_not_ok_yields_none_position(tmp_path, monkeypatch):
-    # 300 根 < live_signal 最低 800 根：全部 state=insufficient → position None，
-    # 重算本身成功（不 raise），且 derive_rows 遇 None position 必须安全（missing）。
-    bars = _sine_bars(300)
+    # 意图：state!="ok" 的行 position=None 且 derive_rows 安全（missing）。
+    # warm-up 预检后，insufficient 场景已在入口被拒绝（见
+    # test_insufficient_history_source_refuses_cache），这里改用「切片充足
+    # （>= _min_bars()）但公式无效」触发 state=error：StackVM 对空 token 序列
+    # 返回 None → evaluate_signal state="公式无有效输出"，逐根均为非 ok。
+    bars = _sine_bars(1120)        # 窗口放历史末端：首根切片 = 1001 >= 800
     monkeypatch.setattr("web.ledger_stats.get_source", lambda kind: _FakeSource(bars))
-    theo, why = LS.recompute_theo("fake", "BTCUSDT", "1h", FORMULA,
-                                  start_ts=290 * 3600, end_ts=299 * 3600,
+    theo, why = LS.recompute_theo("fake", "BTCUSDT", "1h", [],
+                                  start_ts=1110 * 3600, end_ts=1119 * 3600,
                                   cost_rate=0.001, ledger_dir=tmp_path)
     assert why is None
     assert len(theo) == 10
@@ -107,12 +110,16 @@ def test_theo_cache_roundtrip_and_freshness(tmp_path, monkeypatch):
     old = time.time() - 3600.0
     os.utime(ledger, (old, old))  # 账本 mtime 定在 1 小时前
 
-    bars = _sine_bars(300)        # 轻量重算（全部 insufficient，不影响缓存往返）
+    # 窗口放在 1120 根历史的末端：首根窗口下标 ≈1002（fetch 截尾后），切片
+    # 长度 min(1003, 1001)=1001 >= 800，通过 warm-up 预检（意图不变：
+    # 缓存往返 + mtime 新鲜度 + cost_rate 失效，与 position 是否 ok 无关）。
+    bars = _sine_bars(1120)
     monkeypatch.setattr("web.ledger_stats.get_source", lambda kind: _FakeSource(bars))
     theo, why = LS.recompute_theo("fake", "BTCUSDT", "1h", FORMULA,
-                                  start_ts=290 * 3600, end_ts=299 * 3600,
+                                  start_ts=1110 * 3600, end_ts=1119 * 3600,
                                   cost_rate=0.001, ledger_dir=tmp_path)
     assert why is None
+    assert all(r["position"] is not None for r in theo)  # 顺带钉住 ok 路径
 
     theo_path = tmp_path / "fake_BTCUSDT_1h.theo.jsonl"  # {stem}.theo.jsonl
     assert theo_path.exists()
@@ -127,6 +134,24 @@ def test_theo_cache_roundtrip_and_freshness(tmp_path, monkeypatch):
     newer = time.time() + 60.0
     os.utime(ledger, (newer, newer))  # 账本更新 → 缓存过期
     assert LS.theo_is_fresh(ledger, theo_path, 0.001) is False
+
+
+def test_insufficient_history_source_refuses_cache(tmp_path, monkeypatch):
+    """Fix 回归：源静默截断（如 okx 上限 300 根）致窗口首根切片 < _min_bars()
+    → 拒绝重算回 ([], reason)，绝不写 .theo.jsonl 退化缓存。"""
+    from strategy_manager.live_signal import _min_bars
+
+    bars = _sine_bars(300)  # fetch 请求 10+1002 根，源只给得出 300 根
+    monkeypatch.setattr("web.ledger_stats.get_source", lambda kind: _FakeSource(bars))
+    theo, why = LS.recompute_theo("fake", "BTCUSDT", "1h", FORMULA,
+                                  start_ts=0, end_ts=9 * 3600,  # 窗口在历史起点
+                                  cost_rate=0.001, ledger_dir=tmp_path)
+    required = _min_bars()
+    assert theo == []
+    assert why is not None
+    assert "历史 bar 不足" in why
+    assert f"（1/{required}）" in why  # 首根切片 1 根 vs 阈值（不硬编码 800）
+    assert not (tmp_path / "fake_BTCUSDT_1h.theo.jsonl").exists()
 
 
 def test_load_theo_cache_tolerant(tmp_path):

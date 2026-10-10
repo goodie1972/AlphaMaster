@@ -22,7 +22,7 @@ import os
 from pathlib import Path
 
 import web.live_ledger as LL
-from strategy_manager.live_signal import evaluate_signal, min_exposure
+from strategy_manager.live_signal import evaluate_signal, min_exposure, _min_bars
 from web.data_sources.base import bars_to_raw_dict
 from web.data_sources.factory import get_source  # noqa: F401 —— 测试 monkeypatch 本模块属性
 
@@ -269,7 +269,9 @@ def recompute_theo(source, symbol, tf, formula, *,
     收益数学与实盘账本共用一份实现，绝不重复。
 
     返回 (rows, None)；rows 结构同 derive_rows。任何失败（源不可用/拉取异常/
-    未知周期等）返回 ([], reason 字符串)，绝不抛出、绝不写缓存。成功后写
+    未知周期等）返回 ([], reason 字符串)，绝不抛出、绝不写缓存。源静默截断
+    历史（首根窗口切片 < live_signal._min_bars()）同样按失败拒绝，防止退化
+    缓存污染新鲜度判定。成功后写
     `{stem}.theo.jsonl` 原子缓存；缓存写失败仅降级为「下次重算」，不影响返回。
 
     性能：O(窗口 bar 数 × LOOKBACK bar VM)，调用方（B5）必须限制请求跨度。
@@ -285,6 +287,20 @@ def recompute_theo(source, symbol, tf, formula, *,
         bars = src.fetch_bars(str(symbol), tf, need, drop_forming=True)
         if not bars:
             raise RuntimeError("未获取到 K 线")
+        # 数据源可能静默截断响应（如 okx_source 上限 300 根）：fetch 数 < need 时
+        # 窗口首根切片不足 _min_bars() 根 warm-up，evaluate_signal 对每根都回
+        # state!="ok" → 会写出全 position None 的退化缓存并被 theo_is_fresh 永久
+        # 当作新鲜。故先校验首根切片长度，不足则拒绝重算且绝不写缓存（口径同
+        # 下方逐根切片公式 bars[max(0,idx-LOOKBACK):idx+1]）。
+        first_idx = next((i for i, b in enumerate(bars)
+                          if start_ts <= int(b.ts) <= end_ts), None)
+        if first_idx is not None:
+            warm = min(first_idx + 1, _THEO_LOOKBACK + 1)
+            required = _min_bars()
+            if warm < required:
+                return [], (f"数据源历史 bar 不足（{warm}/{required}）："
+                            f"窗口首根可用切片仅 {warm} 根，无法 warm-up，"
+                            f"已放弃重算且不写缓存")
         sha = LL.formula_sha(formula)
         recs: list[LL.LedgerRecord] = []
         for idx, b in enumerate(bars):
