@@ -38,12 +38,33 @@ def _tf_seconds(tf: str) -> int:
     exact = _TF_SECONDS.get(tf)
     if exact is not None:
         return exact
-    # parquet 域 "H1"/"M15"/"D1"/"W1"：字母+数字
+    # parquet 域 "H1"/"M15"/"D1"/"W1"：字母+数字；数字部分 <1（H0/M0）拒绝，防 tf_s=0
     if len(tf) >= 2 and tf[0].isalpha() and tf[1:].isdigit():
+        mult = int(tf[1:])
         unit = _UNIT_SECONDS.get(tf[0].lower())
-        if unit is not None:
-            return unit * int(tf[1:])
+        if unit is not None and mult >= 1:
+            return unit * mult
     raise ValueError(f"未知周期: {tf!r}")
+
+
+def _density_ppy(rows, tf_s: int) -> float:
+    """年化因子：镜像 estimate_periods_per_year（model_core/backtest.py:33-56）口径。
+
+    ppy = 行数 ÷ ((末 bar_ts − 首 bar_ts) 秒 / 年秒数)，用账本行自身时间戳估计
+    每年 bar 密度；全部行参与（含 missing——它们同样是真实观测）。
+    回测数据只含交易时段 bar，密度口径自动适应外汇/股票闭市空档
+    （日历口径对 FX H1 会虚高：8766 vs 实际 ~6240）。
+    行数 <2、span<=0 或 ppy 异常（<=0/非有限）→ 回退日历 365.25*86400/tf_s，
+    对应 backtest 估计失败时的默认值回退（此处回退到该 tf 的日历 ppy）。
+    """
+    bar_tss = [int(r["bar_ts"]) for r in rows if r.get("bar_ts") is not None]
+    if len(bar_tss) >= 2:
+        span = float(max(bar_tss) - min(bar_tss))
+        if span > 0:
+            ppy = len(bar_tss) / (span / _SECONDS_PER_YEAR)
+            if ppy > 0 and math.isfinite(ppy):
+                return ppy
+    return _SECONDS_PER_YEAR / tf_s
 
 
 def derive_rows(records, *, tf: str, cost_rate: float) -> list[dict]:
@@ -121,18 +142,22 @@ def compute_stats(rows, cost_rate, *, tf: str,
                   first_ts=None, last_ts=None) -> dict:
     """聚合统计（spec §5.5）。
 
-    cost_rate 保留在签名中（与 derive_rows 口径对齐）；本函数内 pnl 已含成本，
-    不再重复使用。统计口径：
+    cost_rate 保留在签名中（retained per API contract, B5 passes it）；
+    本函数内 pnl 已在 derive_rows 净额化，参数在函数体中不再使用。统计口径：
     - win_rate/profit_factor：非 missing 且 |position| >= min_exposure() 的行；
       胜率纯方向（pos*ret>0，不含成本）；盈亏比 = 盈利均值 ÷ |亏损均值|（含成本），
+      pnl==0 的行被两组均值同时排除（严格 >0 / <0）；
       无亏损行 → None，无盈利行（但有亏损）→ 0.0。
     - annualized/sortino/max_drawdown：全部非 missing 行的 pnl（不过滤低敞口）。
+    - 年化因子（annualized 与 sortino 共用）为密度口径，镜像
+      model_core/backtest.py 的 estimate_periods_per_year：ppy = 行数 ÷
+      (首尾 bar_ts 跨度年数)，含 missing 行；估计失败回退日历 365.25*86400/tf_s。
     - live_bars=行数；theoretical_bars=[first_ts,last_ts] 内应有 bar 数，
       ts 缺省时用非 missing 行 bar_ts 的 min/max；不可确定 → None。
       完整率（记录数÷源 bar 数）由上层 API 计算（源 bar 数可能不可得）。
     """
-    tf_s = _tf_seconds(tf)
-    ppy = _SECONDS_PER_YEAR / tf_s
+    tf_s = _tf_seconds(tf)          # tf_s 仅用于 theoretical_bars
+    ppy = _density_ppy(rows, tf_s)  # 年化因子：密度口径，镜像 backtest 估计
 
     valid = [r for r in rows if not r["missing"] and r["pnl"] is not None]
     min_exp = min_exposure()
