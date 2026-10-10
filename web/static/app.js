@@ -1200,7 +1200,7 @@ async function stopTraining() {
 // 分页切换
 // ═══════════════════════════════════════════════════════════════════
 function switchPage(page) {
-  if (page !== "train" && page !== "backtest" && page !== "realtime") return;
+  if (page !== "train" && page !== "backtest" && page !== "realtime" && page !== "ledger") return;
   currentPage = page;
   document.querySelectorAll(".stepper .step").forEach((s) => {
     s.classList.toggle("active", s.dataset.page === page);
@@ -1214,6 +1214,8 @@ function switchPage(page) {
   } else if (page === "realtime") {
     initRealtimeOnce();
     refreshRealtime();
+  } else if (page === "ledger") {
+    initLedger();
   }
 }
 
@@ -2630,6 +2632,371 @@ async function init() {
   }
 
   startPolling();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 实盘台账（04 页）
+// ═══════════════════════════════════════════════════════════════════
+let ledgerInited = false;
+let ledgerSeq = 0;          // summary/curve 请求序号：切换 watch/时间窗后丢弃过期响应
+let ledgerRecordsSeq = 0;   // 明细列表独立序号（分页/方向筛选只重拉 records）
+let ledgerOffset = 0;       // 明细分页偏移
+const LEDGER_PAGE_SIZE = 50;
+const LEDGER_EMPTY_TEXT = "台账自添加 watch 起积累，服务重启不丢";
+const LEDGER_DIR_CN = { LONG: "开多", SHORT: "开空", FLAT: "平仓" };
+
+async function initLedger() {
+  if (!ledgerInited) {
+    ledgerInited = true;
+    const sel = $("ledgerWatch");
+    if (sel) sel.addEventListener("change", () => { ledgerOffset = 0; loadLedgerData(); });
+    const days = $("ledgerDays");
+    if (days) days.addEventListener("change", () => { ledgerOffset = 0; loadLedgerData(); });
+    const dir = $("ledgerDir");
+    if (dir) dir.addEventListener("change", () => { ledgerOffset = 0; loadLedgerRecords(); });
+    const prev = $("ledgerPrevBtn");
+    if (prev) prev.addEventListener("click", () => {
+      ledgerOffset = Math.max(0, ledgerOffset - LEDGER_PAGE_SIZE);
+      loadLedgerRecords();
+    });
+    const next = $("ledgerNextBtn");
+    if (next) next.addEventListener("click", () => {
+      ledgerOffset += LEDGER_PAGE_SIZE;
+      loadLedgerRecords();
+    });
+  }
+  await loadLedger();
+}
+
+function ledgerWatchId() {
+  const sel = $("ledgerWatch");
+  return sel ? sel.value : "";
+}
+
+function ledgerDaysVal() {
+  const sel = $("ledgerDays");
+  return sel ? sel.value : "30";
+}
+
+// 台账列表 → 下拉；每次进入 04 页都重拉（watch 可能刚在 03 页新增）
+async function loadLedger() {
+  const hint = $("ledgerHint");
+  if (hint) { hint.textContent = "加载台账…"; hint.classList.remove("invalid"); }
+  let data;
+  try {
+    data = await fetchJSON("/api/ledger/watches", { silent: true, retries: 1 });
+  } catch (e) {
+    if (hint) { hint.textContent = `台账列表加载失败：${e.message}`; hint.classList.add("invalid"); }
+    return;
+  }
+  if (data.error) {
+    if (hint) { hint.textContent = `台账列表加载失败：${data.error}`; hint.classList.add("invalid"); }
+    return;
+  }
+  const watches = data.watches || [];
+  const sel = $("ledgerWatch");
+  if (!sel) return;
+  const prevVal = sel.value;
+  if (!watches.length) {
+    sel.innerHTML = '<option value="">暂无台账</option>';
+    if (hint) hint.textContent = `${LEDGER_EMPTY_TEXT}。在「03 实时分析」添加 watch 后，每根收盘 bar 记一行。`;
+    renderLedgerStats(null, null);
+    drawLedgerChart($("ledgerChart"), null);
+    resetLedgerTable(`${LEDGER_EMPTY_TEXT}。`);
+    renderLedgerCsv("", "", null);
+    return;
+  }
+  sel.innerHTML = watches
+    .map((w) => `<option value="${escHtml(w.watch_id)}">${escHtml(w.watch_id)} · ${escHtml(w.records ?? 0)} 条${w.corrupt_lines ? `（坏行 ${escHtml(w.corrupt_lines)}）` : ""}</option>`)
+    .join("");
+  if (prevVal && watches.some((w) => w.watch_id === prevVal)) sel.value = prevVal;
+  if (hint) hint.textContent = `共 ${watches.length} 个台账 · 目录 ${data.ledger_dir || "—"}`;
+  await loadLedgerData();
+}
+
+// 并发拉 summary/curve（records 独立分页，一并触发）
+async function loadLedgerData() {
+  const watchId = ledgerWatchId();
+  if (!watchId) {
+    renderLedgerStats(null, null);
+    drawLedgerChart($("ledgerChart"), null);
+    resetLedgerTable(`${LEDGER_EMPTY_TEXT}。`);
+    renderLedgerCsv("", "", null);
+    return;
+  }
+  const seq = ++ledgerSeq;
+  const days = ledgerDaysVal();
+  const q = `watch_id=${encodeURIComponent(watchId)}&days=${encodeURIComponent(days)}`;
+  const fetchOpts = { silent: true, retries: 1 };
+  const [summary, curve] = await Promise.all([
+    // 200+{"error"} 原样返回；422/网络错误由 fetchJSON 抛出（formatApiError 已处理 detail 数组）
+    fetchJSON(`/api/ledger/summary?${q}`, fetchOpts).catch((e) => ({ error: e.message })),
+    fetchJSON(`/api/ledger/curve?${q}`, fetchOpts).catch((e) => ({ error: e.message })),
+  ]);
+  if (seq !== ledgerSeq) return; // 已切到更新的 watch/时间窗
+  renderLedgerStats(summary, curve);
+  drawLedgerChart($("ledgerChart"), curve);
+  renderLedgerCsv(watchId, days, summary);
+  await loadLedgerRecords();
+}
+
+function ledgerNull(v) {
+  return v == null || !Number.isFinite(Number(v));
+}
+
+// Pearson 相关系数：spec §5.7「实盘vs理论相关性」前端自算（B5 裁决，非 API 字段）。
+// 只用 theo_missing=false 且 cum_theo/cum_live 齐的点，需 ≥3 对齐点，否则 null→「—」。
+function ledgerCorrelation(curveResp) {
+  const pts = ((curveResp && curveResp.curve) || []).filter(
+    (p) => p && !p.theo_missing && Number.isFinite(p.cum_live) && Number.isFinite(p.cum_theo)
+  );
+  const n = pts.length;
+  if (n < 3) return null;
+  const xs = pts.map((p) => p.cum_live);
+  const ys = pts.map((p) => p.cum_theo);
+  const mx = xs.reduce((a, b) => a + b, 0) / n;
+  const my = ys.reduce((a, b) => a + b, 0) / n;
+  let sxy = 0, sxx = 0, syy = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i] - mx, dy = ys[i] - my;
+    sxy += dx * dy; sxx += dx * dx; syy += dy * dy;
+  }
+  if (sxx <= 0 || syy <= 0) return null; // 常值序列无定义
+  return sxy / Math.sqrt(sxx * syy);
+}
+
+// 统计卡：null→「—」；theo 不可用→角标说明原因（实盘统计照常，spec §5.7/§6）
+function renderLedgerStats(summary, curve) {
+  const grid = $("ledgerStats");
+  const hintEl = $("ledgerStatsHint");
+  if (!grid) return;
+  if (!summary) {
+    grid.innerHTML = `<div class="metric-empty">${LEDGER_EMPTY_TEXT}</div>`;
+    if (hintEl) hintEl.textContent = "—";
+    return;
+  }
+  if (summary.error) {
+    grid.innerHTML = `<div class="metric-empty">统计加载失败：${escHtml(summary.error)}</div>`;
+    if (hintEl) hintEl.textContent = "—";
+    return;
+  }
+  const fmtOrNull = (v, fn) => (ledgerNull(v) ? "—" : fn(Number(v)));
+  const corr = ledgerCorrelation(curve && !curve.error ? curve : null);
+  const cards = [
+    { label: "完整率", value: fmtOrNull(summary.completeness, (v) => (v * 100).toFixed(1) + "%"), cls: "" },
+    { label: "胜率", value: fmtOrNull(summary.win_rate, (v) => (v * 100).toFixed(1) + "%"), cls: "" },
+    { label: "盈亏比", value: fmtOrNull(summary.profit_factor, METRIC_FMT.ratio), cls: "" },
+    { label: "Sortino", value: fmtOrNull(summary.sortino, METRIC_FMT.signed), cls: ledgerNull(summary.sortino) ? "" : (summary.sortino >= 0 ? "pos" : "neg") },
+    { label: "年化", value: fmtOrNull(summary.annualized, METRIC_FMT.pct), cls: ledgerNull(summary.annualized) ? "" : (summary.annualized >= 0 ? "pos" : "neg") },
+    { label: "MDD", value: fmtOrNull(summary.max_drawdown, (v) => "-" + (v * 100).toFixed(2) + "%"), cls: !ledgerNull(summary.max_drawdown) && summary.max_drawdown > 0 ? "neg" : "" },
+    { label: "实盘vs理论相关性", value: fmtOrNull(corr, (v) => v.toFixed(3)), cls: "accent" },
+    { label: "损坏行", value: fmtOrNull(summary.corrupt_lines, (v) => String(Math.round(v))), cls: !ledgerNull(summary.corrupt_lines) && summary.corrupt_lines > 0 ? "neg" : "" },
+  ];
+  const theoOk = summary.theo_available !== false;
+  const badge = theoOk ? "" : `
+    <div class="metric-card" style="grid-column:1/-1">
+      <div class="metric-label">理论线</div>
+      <div class="metric-value" style="font-size:0.95rem;color:#f7a34f">理论线不可用：${escHtml(summary.theo_reason || "原因未知")}</div>
+    </div>`;
+  grid.innerHTML =
+    badge +
+    cards
+      .map(
+        (c) => `
+    <div class="metric-card ${c.cls}">
+      <div class="metric-label">${c.label}</div>
+      <div class="metric-value ${c.cls}">${c.value}</div>
+    </div>`
+      )
+      .join("");
+  if (hintEl) {
+    const bits = [`${summary.records ?? 0} 条实盘记录`];
+    if (theoOk && summary.theo_bars != null) bits.push(`${summary.theo_bars} 根理论 bar`);
+    if (theoOk && summary.divergence_count != null) bits.push(`${summary.divergence_count} 根分叉 bar`);
+    if (summary.sha) bits.push(`sha ${summary.sha}`);
+    hintEl.textContent = bits.join(" · ");
+  }
+}
+
+// 明细表：每页 50 条 + 上一页/下一页（新→旧，与 /records 排序一致）
+async function loadLedgerRecords() {
+  const watchId = ledgerWatchId();
+  if (!watchId) {
+    resetLedgerTable(`${LEDGER_EMPTY_TEXT}。`);
+    return;
+  }
+  const seq = ++ledgerRecordsSeq;
+  const days = ledgerDaysVal();
+  const dir = $("ledgerDir") ? $("ledgerDir").value : "";
+  let q = `watch_id=${encodeURIComponent(watchId)}&limit=${LEDGER_PAGE_SIZE}&offset=${ledgerOffset}`;
+  if (days) q += `&days=${encodeURIComponent(days)}`;
+  if (dir) q += `&direction=${encodeURIComponent(dir)}`;
+  let d;
+  try {
+    d = await fetchJSON(`/api/ledger/records?${q}`, { silent: true, retries: 1 });
+  } catch (e) {
+    d = { error: e.message };
+  }
+  if (seq !== ledgerRecordsSeq) return;
+  const body = $("ledgerTableBody");
+  const hintEl = $("ledgerTableHint");
+  const prevBtn = $("ledgerPrevBtn");
+  const nextBtn = $("ledgerNextBtn");
+  if (!body) return;
+  if (d.error) {
+    body.innerHTML = `<tr class="empty-row"><td colspan="8">明细加载失败：${escHtml(d.error)}</td></tr>`;
+    if (hintEl) hintEl.textContent = "—";
+    if (prevBtn) prevBtn.disabled = true;
+    if (nextBtn) nextBtn.disabled = true;
+    return;
+  }
+  const recs = d.records || [];
+  const total = d.total || 0;
+  if (!recs.length) {
+    body.innerHTML = `<tr class="empty-row"><td colspan="8">${LEDGER_EMPTY_TEXT}。</td></tr>`;
+  } else {
+    body.innerHTML = recs
+      .map((r) => {
+        const dirKey = String(r.direction || "").toUpperCase();
+        const dirLabel = LEDGER_DIR_CN[dirKey] || (r.direction || "—");
+        const dirCls = dirKey === "LONG" ? "pos" : dirKey === "SHORT" ? "neg" : "";
+        const pnlCls = Number.isFinite(r.pnl) ? (r.pnl >= 0 ? "pos" : "neg") : "";
+        return `<tr>
+          <td>${escHtml(r.bar_ts ? new Date(r.bar_ts * 1000).toLocaleString() : "—")}</td>
+          <td class="${dirCls}">${escHtml(dirLabel)}</td>
+          <td>${ledgerNull(r.strength) ? "—" : Math.round(r.strength * 100) + "%"}</td>
+          <td>${fmtSigned(r.factor_value)}</td>
+          <td>${ledgerNull(r.position) ? "—" : fmtSigned(r.position, 2)}</td>
+          <td>${ledgerNull(r.close) ? "—" : Number(r.close).toLocaleString()}</td>
+          <td class="${pnlCls}">${ledgerNull(r.pnl) ? "—" : fmtPct(r.pnl, 3)}</td>
+          <td>${r.missing ? `<span title="相邻 bar 缺口，本行未计收益">缺口</span>` : ""}</td>
+        </tr>`;
+      })
+      .join("");
+  }
+  if (hintEl) {
+    hintEl.textContent = total
+      ? `${ledgerOffset + 1}–${Math.min(ledgerOffset + LEDGER_PAGE_SIZE, total)} / 共 ${total} 条`
+      : "共 0 条";
+  }
+  if (prevBtn) prevBtn.disabled = ledgerOffset <= 0;
+  if (nextBtn) nextBtn.disabled = ledgerOffset + LEDGER_PAGE_SIZE >= total;
+}
+
+function resetLedgerTable(emptyText) {
+  const body = $("ledgerTableBody");
+  if (body) {
+    body.innerHTML = `<tr class="empty-row"><td colspan="8">${escHtml(emptyText || `${LEDGER_EMPTY_TEXT}。`)}</td></tr>`;
+  }
+  const hintEl = $("ledgerTableHint");
+  if (hintEl) hintEl.textContent = "—";
+  const prevBtn = $("ledgerPrevBtn");
+  const nextBtn = $("ledgerNextBtn");
+  if (prevBtn) prevBtn.disabled = true;
+  if (nextBtn) nextBtn.disabled = true;
+}
+
+// CSV 导出链接：sha 用 summary 返回的当前段（缺省则交给服务端默认最新段）
+function renderLedgerCsv(watchId, days, summary) {
+  const a = $("ledgerCsv");
+  if (!a) return;
+  if (!watchId || (summary && summary.error)) {
+    a.hidden = true;
+    return;
+  }
+  const sha = summary && summary.sha;
+  a.href =
+    `/api/ledger/export?watch_id=${encodeURIComponent(watchId)}&days=${encodeURIComponent(days)}` +
+    (sha ? `&sha=${encodeURIComponent(sha)}` : "");
+  a.hidden = false;
+}
+
+// 自绘叠图（无外部库）：实盘 #4f8ef7 / 理论 #f7a34f，x=bar_ts 时间轴，
+// theo_missing 断点不连线（缺口两侧分开画线段），spec §5.7/§6。
+function drawLedgerChart(canvas, resp) {
+  if (!canvas || !canvas.getContext) return;
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  const legend = '<span style="color:#4f8ef7">■ 实盘</span> <span style="color:#f7a34f">■ 理论</span>';
+  const hintEl = $("ledgerChartHint");
+  const pts = ((resp && resp.curve) || []).slice().sort((a, b) => a.bar_ts - b.bar_ts);
+  if (!pts.length) {
+    ctx.fillStyle = "#8b93a7";
+    ctx.font = "13px 'DM Sans', sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const msg = resp && resp.error ? `曲线加载失败：${resp.error}` : `${LEDGER_EMPTY_TEXT}（窗口内暂无曲线点）`;
+    ctx.fillText(msg, W / 2, H / 2);
+    if (hintEl) hintEl.innerHTML = legend;
+    return;
+  }
+  const padL = 58, padR = 14, padT = 18, padB = 28;
+  let yMin = Infinity, yMax = -Infinity;
+  for (const p of pts) {
+    const vals = [];
+    if (Number.isFinite(p.cum_live)) vals.push(p.cum_live);
+    if (!p.theo_missing && Number.isFinite(p.cum_theo)) vals.push(p.cum_theo);
+    for (const v of vals) { if (v < yMin) yMin = v; if (v > yMax) yMax = v; }
+  }
+  if (!Number.isFinite(yMin) || !Number.isFinite(yMax)) { yMin = -0.01; yMax = 0.01; }
+  if (yMax - yMin < 1e-9) { yMin -= 0.005; yMax += 0.005; }
+  let xMin = pts[0].bar_ts, xMax = pts[pts.length - 1].bar_ts;
+  if (xMax - xMin < 1) { xMin -= 1; xMax += 1; }
+  const sx = (t) => padL + ((t - xMin) / (xMax - xMin)) * (W - padL - padR);
+  const sy = (v) => padT + ((yMax - v) / (yMax - yMin)) * (H - padT - padB);
+
+  // 网格 + y 轴刻度（cum 为对数累计收益 → 显示为百分比）
+  ctx.font = "10px 'JetBrains Mono', monospace";
+  for (let i = 0; i <= 4; i++) {
+    const v = yMax - ((yMax - yMin) * i) / 4;
+    const y = sy(v);
+    ctx.strokeStyle = "rgba(255,255,255,0.07)";
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+    ctx.fillStyle = "#8b93a7";
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    ctx.fillText((v >= 0 ? "+" : "") + (v * 100).toFixed(2) + "%", padL - 6, y);
+  }
+  // x 轴首/中/尾时间标签
+  const fmtTs = (t) => new Date(t * 1000).toLocaleString([], { month: "2-digit", day: "2-digit", hour: "2-digit" });
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  ctx.fillText(fmtTs(xMin), sx(xMin) + 14, H - padB + 6);
+  ctx.fillText(fmtTs((xMin + xMax) / 2), sx((xMin + xMax) / 2), H - padB + 6);
+  ctx.fillText(fmtTs(xMax), sx(xMax) - 14, H - padB + 6);
+
+  // 单条折线：点值非有限或 theo_missing → 断笔，不跨缺口连线
+  const drawLine = (color, getVal) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    let pen = false;
+    for (const p of pts) {
+      const v = getVal(p);
+      if (v == null || !Number.isFinite(v)) { pen = false; continue; }
+      const x = sx(p.bar_ts), y = sy(v);
+      if (!pen) { ctx.moveTo(x, y); pen = true; } else { ctx.lineTo(x, y); }
+    }
+    ctx.stroke();
+  };
+  drawLine("#4f8ef7", (p) => p.cum_live);
+  const theoShown = resp.theo_available !== false;
+  if (theoShown) drawLine("#f7a34f", (p) => (p.theo_missing ? null : p.cum_theo));
+
+  // 理论不可用：图上标注原因（叠图退化为实盘单线，spec §6）
+  ctx.textAlign = "left"; ctx.textBaseline = "top"; ctx.font = "11px 'DM Sans', sans-serif";
+  if (!theoShown) {
+    ctx.fillStyle = "#f7a34f";
+    ctx.fillText(`理论线不可用：${resp.theo_reason || "原因未知"}`, padL + 6, padT + 2);
+  } else if (pts.some((p) => p.theo_missing)) {
+    const gaps = pts.filter((p) => p.theo_missing).length;
+    ctx.fillStyle = "#8b93a7";
+    ctx.fillText(`理论缺口 ${gaps} 根`, padL + 6, padT + 2);
+  }
+  if (hintEl) {
+    const n = (resp.curve || []).length;
+    const missing = (resp.curve || []).filter((p) => p.theo_missing).length;
+    hintEl.innerHTML = `${legend}${theoShown ? "" : ' <span style="color:#f7a34f">理论线不可用</span>'} · ${n} 点${n ? ` · 缺口 ${missing}` : ""}`;
+  }
 }
 
 init();

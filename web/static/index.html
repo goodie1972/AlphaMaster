@@ -65,6 +65,14 @@
           <span class="step-sub">信号雷达 · 多品种并发</span>
         </span>
       </button>
+      <span class="step-link"></span>
+      <button type="button" class="step" data-page="ledger">
+        <span class="step-index">04</span>
+        <span class="step-body">
+          <span class="step-title">实盘台账</span>
+          <span class="step-sub">信号记账 · 实盘 vs 理论</span>
+        </span>
+      </button>
     </nav>
 
     <!-- ══════════════ 步骤一：训练页 ══════════════ -->
@@ -534,6 +542,100 @@
       </section>
     </div><!-- /page-realtime -->
 
+    <!-- ══════════════ 步骤四：实盘台账页 ══════════════ -->
+    <div class="page" id="page-ledger">
+      <section class="panel launch-panel">
+        <span class="hud-corner tl"></span><span class="hud-corner tr"></span>
+        <span class="hud-corner bl"></span><span class="hud-corner br"></span>
+        <h2>实盘信号台账</h2>
+        <div class="rt-form">
+          <label class="rt-field rt-field-wide">
+            <span>台账（watch）</span>
+            <select id="ledgerWatch"></select>
+          </label>
+          <label class="rt-field">
+            <span>时间窗</span>
+            <select id="ledgerDays">
+              <option value="7">7 天</option>
+              <option value="30" selected>30 天</option>
+              <option value="90">90 天</option>
+            </select>
+          </label>
+          <label class="rt-field">
+            <span>方向筛选</span>
+            <select id="ledgerDir">
+              <option value="">全部</option>
+              <option value="LONG">开多</option>
+              <option value="SHORT">开空</option>
+              <option value="FLAT">平仓</option>
+            </select>
+          </label>
+        </div>
+        <small class="field-hint" id="ledgerHint">台账自添加 watch 起积累，服务重启不丢。</small>
+      </section>
+
+      <section class="panel bt-summary-panel">
+        <span class="hud-corner tl"></span><span class="hud-corner tr"></span>
+        <span class="hud-corner bl"></span><span class="hud-corner br"></span>
+        <div class="panel-head">
+          <h2>台账统计</h2>
+          <span class="hint" id="ledgerStatsHint">—</span>
+        </div>
+        <div class="metric-grid" id="ledgerStats">
+          <div class="metric-empty">台账自添加 watch 起积累，服务重启不丢</div>
+        </div>
+      </section>
+
+      <section class="panel bt-charts-panel">
+        <span class="hud-corner tl"></span><span class="hud-corner tr"></span>
+        <span class="hud-corner bl"></span><span class="hud-corner br"></span>
+        <div class="panel-head">
+          <h2>实盘 vs 理论资金曲线</h2>
+          <span class="hint" id="ledgerChartHint">
+            <span style="color:#4f8ef7">■ 实盘</span>
+            <span style="color:#f7a34f">■ 理论</span>
+          </span>
+        </div>
+        <div style="overflow-x:auto">
+          <canvas id="ledgerChart" width="900" height="320"></canvas>
+        </div>
+      </section>
+
+      <section class="panel bt-table-panel">
+        <span class="hud-corner tl"></span><span class="hud-corner tr"></span>
+        <span class="hud-corner bl"></span><span class="hud-corner br"></span>
+        <div class="panel-head">
+          <h2>信号明细</h2>
+          <span class="hint" id="ledgerTableHint">—</span>
+        </div>
+        <div class="table-wrap">
+          <table class="bt-table" id="ledgerTable">
+            <thead>
+              <tr>
+                <th>Bar 时间</th>
+                <th>方向</th>
+                <th>把握</th>
+                <th>因子</th>
+                <th>仓位</th>
+                <th>收盘</th>
+                <th>收益</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody id="ledgerTableBody">
+              <tr class="empty-row"><td colspan="8">台账自添加 watch 起积累，服务重启不丢</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="launch-actions">
+          <button type="button" class="btn btn-secondary" id="ledgerPrevBtn" disabled>上一页</button>
+          <button type="button" class="btn btn-secondary" id="ledgerNextBtn" disabled>下一页</button>
+          <span class="action-sep" aria-hidden="true"></span>
+          <a class="btn btn-secondary" id="ledgerCsv" href="#" hidden>导出 CSV</a>
+        </div>
+      </section>
+    </div><!-- /page-ledger -->
+
     <div class="modal" id="rtFeishuHelpModal" hidden>
       <div class="modal-backdrop" data-close-feishu-help></div>
       <div class="modal-card modal-card-feishu-help" role="dialog" aria-labelledby="rtFeishuHelpTitle">
@@ -577,6 +679,6 @@
   </div>
 
   <script src="/static/bg.js?v=1"></script>
-  <script src="/static/app.js?v=61"></script>
+  <script src="/static/app.js?v=62"></script>
 </body>
 </html>
