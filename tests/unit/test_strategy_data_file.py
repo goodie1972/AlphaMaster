@@ -55,7 +55,8 @@ def test_sync_best_writes_data_file(project: Path) -> None:
     parquet.write_bytes(b"PAR1")
     save_settings({"last_data_file": str(parquet.resolve())})
 
-    strat_path = project / "strategies" / "best_XAUUSD.json"
+    # A3 起 sync 只读新命名 best_{symbol}_{tf}.json，种子文件同步用新命名
+    strat_path = project / "strategies" / "best_XAUUSD_H1.json"
     strat_path.write_text(
         json.dumps(
             {

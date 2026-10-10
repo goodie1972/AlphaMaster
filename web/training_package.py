@@ -16,16 +16,48 @@ from web.progress import (
     CHECKPOINT_DIR,
     PROJECT_ROOT,
     _decode_formula,
-    _load_strategy,
     checkpoint_glob,
     invalidate_checkpoint_cache,
+    strategy_files_for_symbol,
 )
+from web.strategy_file import strategy_path_for_symbol, tf_from_best_name
 
 _CKPT_NAME_RE = re.compile(r"^ckpt_(.+)_step_(\d+)\.pt$", re.IGNORECASE)
 
 
 def _history_path(symbol: str) -> Path:
     return PROJECT_ROOT / f"training_history_{symbol}.json"
+
+
+def _load_export_strategy(
+    symbol: str,
+    timeframe: str | None,
+) -> tuple[dict | None, Path | None]:
+    """选择导出用策略文件，只认新命名 best_{symbol}_{tf}.json。
+
+    显式 timeframe → 该精确文件（非法周期由 strategy_path_for_symbol 抛 ValueError）；
+    缺省时若该品种恰好只有一个新命名策略文件则用它，多个则抛 ValueError 要求显式
+    指定，没有则不导出策略。绝不读取旧命名 best_{symbol}.json。
+    """
+    tf = (timeframe or "").strip()
+    if tf:
+        path = strategy_path_for_symbol(symbol, tf)
+    else:
+        files = strategy_files_for_symbol(symbol)
+        if len(files) > 1:
+            tfs = "/".join(str(tf_from_best_name(p)) for p in files)
+            raise ValueError(
+                f"{symbol} 存在多个周期的策略文件（{tfs}），导出前需显式指定 timeframe"
+            )
+        if not files:
+            return None, None
+        path = files[0]
+    if not path.exists():
+        return None, None
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), path
+    except (json.JSONDecodeError, OSError):
+        return None, None
 
 
 def _symbol_from_ckpt_name(name: str) -> str | None:
@@ -47,7 +79,7 @@ def _validate_checkpoint_file(path: Path) -> dict[str, Any]:
     return {"step": step, "symbol": symbol, "best_score": ckpt.get("best_score")}
 
 
-def build_training_export_zip(symbol: str) -> tuple[bytes, str]:
+def build_training_export_zip(symbol: str, timeframe: str | None = None) -> tuple[bytes, str]:
     ckpts = checkpoint_glob(symbol)
     if not ckpts:
         raise FileNotFoundError(f"未找到 {symbol} 的训练检查点，请先训练并保存 checkpoint")
@@ -55,7 +87,7 @@ def build_training_export_zip(symbol: str) -> tuple[bytes, str]:
     latest = ckpts[-1]
     _validate_checkpoint_file(latest)
 
-    strategy = _load_strategy(symbol)
+    strategy, strategy_file = _load_export_strategy(symbol, timeframe)
     history_path = _history_path(symbol)
 
     step = int(re.search(r"_step_(\d+)\.pt$", latest.name).group(1))
@@ -70,13 +102,16 @@ def build_training_export_zip(symbol: str) -> tuple[bytes, str]:
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "files": [f"checkpoints/{latest.name}"],
     }
+    if strategy_file is not None:
+        manifest["timeframe"] = tf_from_best_name(strategy_file)
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.write(latest, f"checkpoints/{latest.name}")
 
         if strategy:
-            strat_name = f"strategies/best_{symbol}.json"
+            # 新命名契约：成员路径与实际文件名一致，best_{symbol}_{tf}.json
+            strat_name = f"strategies/{strategy_file.name}"
             payload = dict(strategy)
             if payload.get("formula") and not payload.get("formula_decoded"):
                 payload["formula_decoded"] = _decode_formula(payload["formula"])

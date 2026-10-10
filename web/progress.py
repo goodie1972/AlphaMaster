@@ -89,6 +89,8 @@ def _load_checkpoint_meta(path: Path) -> dict[str, Any]:
         "best_score": ckpt.get("best_score"),
         "best_formula": ckpt.get("best_formula"),
         "training_history": ckpt.get("training_history") or {},
+        # 新 checkpoint 可能携带训练周期；旧文件缺省为 None，由上层解析链兜底
+        "timeframe": ckpt.get("timeframe"),
     }
     _ckpt_cache[key] = (mtime, meta)
     return meta
@@ -104,14 +106,37 @@ def _decode_formula(tokens: list[int] | None) -> str | None:
         return str(tokens)
 
 
-def _load_strategy(symbol: str) -> dict[str, Any] | None:
-    path = STRATEGIES_DIR / f"best_{symbol}.json"
+def _load_strategy(symbol: str, timeframe: str | None = None) -> dict[str, Any] | None:
+    """按新命名 best_{symbol}_{tf}.json 读取策略载荷。
+
+    不兼容旧命名：tf 缺失或非法（非 [A-Za-z0-9]{1,4}）时一律返回 None，
+    绝不回退读取 best_{symbol}.json。
+    """
+    tf = (timeframe or "").strip()
+    if not tf or not re.fullmatch(r"[A-Za-z0-9]{1,4}", tf):
+        return None
+    path = STRATEGIES_DIR / f"best_{symbol}_{tf}.json"
     if not path.exists():
         return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
+
+
+def strategy_files_for_symbol(symbol: str) -> list[Path]:
+    """列出该品种的新命名策略文件（按 mtime 升序）；旧命名 best_{symbol}.json 被排除。"""
+    if not STRATEGIES_DIR.exists():
+        return []
+    # 延迟导入：web.strategy_file 模块级依赖本文件，避免循环导入
+    from web.strategy_file import parse_best_stem
+
+    found: list[Path] = []
+    for path in STRATEGIES_DIR.glob(f"best_{symbol}_*.json"):
+        parsed = parse_best_stem(path.stem)
+        if parsed and parsed[0] == symbol:
+            found.append(path)
+    return sorted(found, key=lambda p: p.stat().st_mtime)
 
 
 def _pick_training_history(
@@ -130,9 +155,10 @@ def _pick_training_history(
     return file_history if file_n >= ckpt_n else ckpt_history
 
 
-def get_symbol_progress(symbol: str) -> SymbolProgress:
+def get_symbol_progress(symbol: str, timeframe: str | None = None) -> SymbolProgress:
     train_steps = ModelConfig.TRAIN_STEPS
-    strategy = _load_strategy(symbol)
+    # tf 为 None 时策略字段置空，而非回退读旧命名文件
+    strategy = _load_strategy(symbol, timeframe)
     ckpts = checkpoint_glob(symbol)
 
     current_step = 0
@@ -193,10 +219,25 @@ def get_symbol_progress(symbol: str) -> SymbolProgress:
     )
 
 
-def get_strategy_for_export(symbol: str) -> dict[str, Any]:
-    data = _load_strategy(symbol)
+def get_strategy_for_export(symbol: str, timeframe: str | None = None) -> dict[str, Any]:
+    data = _load_strategy(symbol, timeframe)
+    if data is None and not str(timeframe or "").strip():
+        # 未指定周期时，仅在该品种恰好只有一个新命名策略文件时选用；
+        # 绝不读取旧命名 best_{symbol}.json。
+        files = strategy_files_for_symbol(symbol)
+        if len(files) == 1:
+            try:
+                data = json.loads(files[0].read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                data = None
     if not data:
-        raise FileNotFoundError(f"未找到 {symbol} 的策略，请先完成训练")
+        if str(timeframe or "").strip():
+            raise FileNotFoundError(
+                f"未找到 {symbol} 周期 {timeframe} 的策略，请先完成训练"
+            )
+        raise FileNotFoundError(
+            f"未找到 {symbol} 的策略（需新命名 best_品种_周期.json，且周期唯一或显式指定），请先完成训练"
+        )
     out = dict(data)
     formula = out.get("formula")
     if formula and not out.get("formula_decoded"):
@@ -221,16 +262,26 @@ def list_strategies() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if not STRATEGIES_DIR.exists():
         return rows
+    # 延迟导入避免与 web.strategy_file 的模块级循环依赖
+    from web.strategy_file import parse_best_stem
+
     for path in sorted(STRATEGIES_DIR.glob("best_*.json")):
+        parsed = parse_best_stem(path.stem)
+        if not parsed:
+            continue  # 旧命名 best_{symbol}.json 一律不出现在列表
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             continue
+        if not isinstance(data, dict):
+            continue
         formula = data.get("formula")
+        name_symbol, name_tf = parsed
         rows.append({
             "file": path.name,
-            "symbol": data.get("symbol") or path.stem.replace("best_", "", 1),
-            "timeframe": data.get("timeframe"),
+            "symbol": data.get("symbol") or name_symbol,
+            # timeframe 以文件名为准（命名契约），旧命名已被上方过滤排除
+            "timeframe": name_tf,
             "best_score": data.get("best_score"),
             "formula_decoded": data.get("formula_decoded") or _decode_formula(formula),
             "train_steps": data.get("train_steps"),

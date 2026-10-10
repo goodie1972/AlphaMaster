@@ -14,6 +14,7 @@ from web.progress import (
     _load_checkpoint_meta,
     _load_strategy,
     checkpoint_glob,
+    strategy_files_for_symbol,
 )
 from web.settings import load_settings
 
@@ -232,13 +233,38 @@ def sync_best_strategy_for_symbol(
 ) -> dict[str, Any] | None:
     """在策略文件与检查点中选出最高分策略，写入 strategies/best_{symbol}_{tf}.json。
 
-    周期优先取显式 timeframe 参数；缺省时回退到策略载荷（_load_strategy）中的
-    timeframe 字段；仍无法确定则抛 ValueError（不兼容旧的无周期命名）。
+    周期解析链（全部失败则抛 ValueError，绝不写无周期文件名）：
+    显式 timeframe 参数 → checkpoint meta 的 timeframe → 数据文件解析
+    （_resolve_data_file_for_symbol 已返回 tf）→ 该品种唯一的新命名策略文件。
+    旧命名 best_{symbol}.json 不作为任何读取来源。
     """
-    strat = _load_strategy(symbol)
-    tf = (timeframe or "").strip() or str((strat or {}).get("timeframe") or "").strip()
+    tf = (timeframe or "").strip()
     if not tf:
-        raise ValueError(f"缺少周期，拒绝写入无周期策略名: {symbol!r} 未指定 timeframe")
+        for ckpt_path in checkpoint_glob(symbol):
+            try:
+                meta_tf = _load_checkpoint_meta(ckpt_path).get("timeframe")
+            except Exception:  # 损坏的 ckpt 不应阻断 sync，跳过
+                meta_tf = None
+            if meta_tf:
+                tf = str(meta_tf).strip()
+                break
+    if not tf:
+        _, data_tf = _resolve_data_file_for_symbol(
+            symbol, None, data_file_hint=data_file_hint
+        )
+        tf = str(data_tf or "").strip()
+    if not tf:
+        tfs = {tf_from_best_name(p) for p in strategy_files_for_symbol(symbol)}
+        tfs.discard(None)
+        if len(tfs) == 1:
+            tf = tfs.pop()
+    if not tf:
+        raise ValueError(
+            f"无法确定周期，拒绝写入无周期策略名: {symbol!r}"
+            "（显式 timeframe / ckpt meta / 数据文件 / 既有新命名文件均未提供周期）"
+        )
+
+    strat = _load_strategy(symbol, tf)
 
     candidates: list[tuple[float, list[int], int]] = []
 

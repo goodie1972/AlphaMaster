@@ -86,7 +86,8 @@ def test_inspect_dict_without_symbol_falls_back_to_filename(tmp_strategies: Path
 
 def test_sync_uses_explicit_timeframe(tmp_strategies: Path):
     # findings 1：sync 需要 timeframe 入参，写入 best_{symbol}_{tf}.json
-    seed = tmp_strategies / "best_XAUUSD.json"
+    # （A3 起 _load_strategy 只认新命名，种子文件同步用新命名）
+    seed = tmp_strategies / "best_XAUUSD_M30.json"
     seed.write_text(
         json.dumps({"symbol": "XAUUSD", "formula": [1, 2, 3], "best_score": 1.5}),
         encoding="utf-8",
@@ -102,7 +103,8 @@ def test_sync_uses_explicit_timeframe(tmp_strategies: Path):
 
 
 def test_sync_falls_back_to_payload_timeframe(tmp_strategies: Path):
-    seed = tmp_strategies / "best_XAUUSD.json"
+    # 无显式 timeframe 时，sync 从既有新命名策略文件解析周期（旧命名不参与）
+    seed = tmp_strategies / "best_XAUUSD_H1.json"
     seed.write_text(
         json.dumps(
             {"symbol": "XAUUSD", "formula": [1, 2, 3], "best_score": 1.5, "timeframe": "H1"}

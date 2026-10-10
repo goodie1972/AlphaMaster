@@ -199,16 +199,22 @@ def _strategy_context() -> dict[str, Any]:
     settings = load_settings()
     data_file = settings.get("last_data_file") or ""
     train_symbol = None
+    train_tf = None
     if data_file:
         try:
-            train_symbol = inspect_parquet_file(data_file).get("symbol")
+            info = inspect_parquet_file(data_file)
+            train_symbol = info.get("symbol")
+            train_tf = info.get("timeframe")
         except Exception:
             pass
 
-    resolved = resolve_strategy_file(
-        settings.get("last_strategy_file") or "",
-        train_symbol,
-    )
+    saved = settings.get("last_strategy_file") or ""
+    try:
+        resolved = resolve_strategy_file(saved, train_symbol, train_tf)
+    except ValueError as exc:
+        # 周期无法确定：不回退无周期命名，降级为已保存路径并让错误以消息形式浮出
+        log_error("resolve_strategy_file: timeframe unresolvable", exc)
+        resolved = saved
     strategy_info = None
     if resolved:
         try:
@@ -272,6 +278,31 @@ def _resolve_train_symbol(symbol: str | None = None) -> str | None:
         return None
 
 
+def _resolve_train_timeframe(
+    timeframe: str | None = None,
+    symbol: str | None = None,
+) -> str | None:
+    """解析调用点周期：显式参数 → 运行中训练 job（同品种）→ 设置中的数据文件。"""
+    tf = str(timeframe or "").strip()
+    if tf:
+        return tf
+    job = training_manager.status().get("job") or {}
+    job_tf = str(job.get("timeframe") or "").strip()
+    if job_tf and (not symbol or str(job.get("symbol") or "") == symbol):
+        return job_tf
+    data_file = load_settings().get("last_data_file") or ""
+    if data_file:
+        try:
+            info = inspect_parquet_file(data_file)
+            if not symbol or info.get("symbol") == symbol:
+                tf = str(info.get("timeframe") or "").strip()
+                if tf:
+                    return tf
+        except Exception:
+            pass
+    return None
+
+
 def _wait_training_idle(timeout_s: float = 5.0) -> None:
     import time
 
@@ -286,8 +317,14 @@ def _wait_training_idle(timeout_s: float = 5.0) -> None:
 def _sync_and_persist_best_strategy(
     symbol: str,
     *,
+    timeframe: str | None = None,
     data_file_hint: str | None = None,
 ) -> dict[str, Any] | None:
+    """同步 best_{symbol}_{tf}.json。
+
+    timeframe 可为 None：由 sync 内部解析链（ckpt meta → 数据文件 → 唯一新命名
+    文件）兜底；全部失败时抛 ValueError，由调用方转成用户可见的错误消息。
+    """
     invalidate_checkpoint_cache()
     hint = data_file_hint
     if not hint:
@@ -296,7 +333,7 @@ def _sync_and_persist_best_strategy(
             hint = job.get("data_file") or None
     if not hint:
         hint = load_settings().get("last_data_file") or None
-    info = sync_best_strategy_for_symbol(symbol, data_file_hint=hint)
+    info = sync_best_strategy_for_symbol(symbol, timeframe, data_file_hint=hint)
     if info:
         save_settings({"last_strategy_file": info["strategy_file"]})
     return info
@@ -485,18 +522,29 @@ def api_browse_strategy_file() -> dict[str, Any]:
 
 @app.post("/api/strategy-file/sync-best")
 @app.get("/api/strategy-file/sync-best")
-def api_sync_best_strategy(symbol: str | None = None) -> dict[str, Any]:
+def api_sync_best_strategy(
+    symbol: str | None = None,
+    timeframe: str | None = None,
+) -> dict[str, Any]:
     sym = _resolve_train_symbol(symbol)
     if not sym:
         raise HTTPException(400, "请先选择训练数据文件或指定品种")
-    info = _sync_and_persist_best_strategy(sym)
+    tf = _resolve_train_timeframe(timeframe, sym)
+    try:
+        info = _sync_and_persist_best_strategy(sym, timeframe=tf)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     if not info:
         raise HTTPException(404, f"未找到 {sym} 的可用策略")
     return {"ok": True, **info}
 
 
-def _progress_with_live_step(symbol: str, active: bool) -> dict[str, Any]:
-    p = get_symbol_progress(symbol)
+def _progress_with_live_step(
+    symbol: str,
+    active: bool,
+    timeframe: str | None = None,
+) -> dict[str, Any]:
+    p = get_symbol_progress(symbol, timeframe)
     current_step = p.current_step
     if active:
         live = training_manager.parse_step_from_log()
@@ -558,7 +606,9 @@ def api_overview() -> dict[str, Any]:
         try:
             file_info = inspect_parquet_file(data_file)
             sym = file_info.get("symbol")
-            row = _progress_with_live_step(sym, active=False)
+            row = _progress_with_live_step(
+                sym, active=False, timeframe=file_info.get("timeframe")
+            )
             progress = {
                 "symbol": row["symbol"],
                 "status": row["status"],
@@ -579,7 +629,7 @@ def api_overview() -> dict[str, Any]:
 
     if job and job.get("symbol") and active:
         sym = job["symbol"]
-        row = _progress_with_live_step(sym, active=True)
+        row = _progress_with_live_step(sym, active=True, timeframe=job.get("timeframe"))
         progress = {
             "symbol": row["symbol"],
             "status": "running_job",
@@ -602,8 +652,9 @@ def api_overview() -> dict[str, Any]:
 
 
 @app.get("/api/symbols/{symbol}")
-def api_symbol(symbol: str) -> dict[str, Any]:
-    p = get_symbol_progress(symbol)
+def api_symbol(symbol: str, timeframe: str | None = None) -> dict[str, Any]:
+    tf = _resolve_train_timeframe(timeframe, symbol)
+    p = get_symbol_progress(symbol, tf)
     return {
         "symbol": p.symbol,
         "status": p.status,
@@ -626,17 +677,18 @@ def api_strategies() -> dict[str, Any]:
 
 
 @app.get("/api/strategies/{symbol}/export")
-def api_export_strategy(symbol: str):
+def api_export_strategy(symbol: str, timeframe: str | None = None):
     import json
 
     from fastapi.responses import Response
 
+    tf = _resolve_train_timeframe(timeframe, symbol)
     try:
-        payload = get_strategy_for_export(symbol)
+        payload = get_strategy_for_export(symbol, tf)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    progress = get_symbol_progress(symbol)
+    progress = get_symbol_progress(symbol, tf)
     step = progress.current_step
     score = payload.get("best_score")
     if score is None:
@@ -653,11 +705,12 @@ def api_export_strategy(symbol: str):
 
 
 @app.get("/api/training/{symbol}/export")
-def api_export_training(symbol: str):
+def api_export_training(symbol: str, timeframe: str | None = None):
     from fastapi.responses import Response
 
+    tf = _resolve_train_timeframe(timeframe, symbol)
     try:
-        body, zip_name = build_training_export_zip(symbol)
+        body, zip_name = build_training_export_zip(symbol, tf)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -728,18 +781,27 @@ def api_training_stop() -> dict[str, Any]:
     job = training_manager.status().get("job") or {}
     symbol = job.get("symbol")
     data_file_hint = job.get("data_file")
+    job_timeframe = job.get("timeframe")
     stopped = training_manager.stop()
     strategy_file = None
+    sync_error = None
     if symbol:
         _wait_training_idle()
-        strategy_file = _sync_and_persist_best_strategy(
-            symbol,
-            data_file_hint=data_file_hint,
-        )
+        try:
+            strategy_file = _sync_and_persist_best_strategy(
+                symbol,
+                timeframe=job_timeframe,
+                data_file_hint=data_file_hint,
+            )
+        except ValueError as exc:
+            # 周期解析失败以消息返回，不中断 stop 接口
+            log_error("sync best strategy on stop failed", exc)
+            sync_error = str(exc)
     return {
         "ok": stopped,
         "training": training_manager.status(),
         "strategy_file": strategy_file,
+        "sync_error": sync_error,
     }
 
 
@@ -1015,19 +1077,23 @@ def api_realtime_tradingview_probe() -> dict[str, Any]:
 
 @app.get("/api/realtime/strategies")
 def api_realtime_strategies() -> dict[str, Any]:
-    """已保存的 best_*.json 策略，供因子来源下拉。"""
+    """已保存的新命名 best_{{symbol}}_{{tf}}.json 策略，供因子来源下拉。"""
     rows = []
     for s in list_strategies():
         sym = s.get("symbol")
-        if not sym:
+        tf = s.get("timeframe")
+        if not sym or not tf:
             continue
-        path = strategy_path_for_symbol(sym)
+        try:
+            path = strategy_path_for_symbol(sym, tf)
+        except ValueError:
+            continue  # 周期非法：跳过而非 500
         if not path.exists():
             continue
         rows.append(
             {
                 "symbol": sym,
-                "timeframe": s.get("timeframe"),
+                "timeframe": tf,
                 "best_score": s.get("best_score"),
                 "formula_decoded": s.get("formula_decoded"),
                 "strategy_file": str(path.resolve()),

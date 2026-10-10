@@ -94,9 +94,16 @@ def _recover_last_data_file(current: dict) -> str:
     if cur and not _should_replace_last_data_file(cur):
         return str(Path(cur).resolve())
 
+    # 延迟导入：web.strategy_file 模块级依赖 web.settings，避免循环导入
+    from web.strategy_file import parse_best_stem
+
     for strategy_path in (
         str(current.get("last_strategy_file") or "").strip(),
-        *(str(p) for p in sorted(STRATEGIES_DIR.glob("best_*.json")) if p.is_file()),
+        *(
+            str(p)
+            for p in sorted(STRATEGIES_DIR.glob("best_*.json"))
+            if p.is_file() and parse_best_stem(p.stem) is not None
+        ),
     ):
         if not strategy_path:
             continue
