@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from pathlib import Path
 
 import web.live_ledger as LL
@@ -101,10 +102,15 @@ def derive_rows(records, *, tf: str, cost_rate: float) -> list[dict]:
                "pnl": None, "missing": True}
         if i + 1 < n:
             nxt = recs[i + 1]
+            # 相邻性 + 可计算性：position/close 任一侧为 None（读侧允许 None 透传）
+            # 或非有限值 → 不做数学，该行保持 missing，防 TypeError/NaN 渗透。
             if (int(nxt.bar_ts) - int(cur.bar_ts) == tf_s
-                    and cur.position is not None and nxt.position is not None):
+                    and cur.position is not None and nxt.position is not None
+                    and cur.close is not None and nxt.close is not None):
                 c0, c1 = float(cur.close), float(nxt.close)
-                if c0 > 0.0 and math.isfinite(c0) and math.isfinite(c1):
+                if (c0 > 0.0 and math.isfinite(c0) and math.isfinite(c1)
+                        and math.isfinite(float(cur.position))
+                        and math.isfinite(float(nxt.position))):
                     pos = float(cur.position)
                     ret = c1 / c0 - 1.0
                     turnover = abs(float(nxt.position) - pos)
@@ -193,7 +199,8 @@ def compute_stats(rows, cost_rate, *, tf: str,
     else:
         profit_factor = (sum(profits) / len(profits)) / abs(sum(losses) / len(losses))
 
-    pnls = [float(r["pnl"]) for r in valid]
+    # 非有限 pnl 防御性剔除（读侧已拒 NaN；此处兜底防直接构造的脏记录击穿 _sortino）
+    pnls = [p for p in (float(r["pnl"]) for r in valid) if math.isfinite(p)]
     if pnls:
         annualized = (sum(pnls) / len(pnls)) * ppy
         sortino = _sortino(pnls, ppy)
@@ -232,10 +239,17 @@ _THEO_LOOKBACK = 1000
 _DIVERGENCE_EPS = 1e-6
 
 
-def _theo_path_for(ledger: Path) -> Path:
-    """账本路径 → 理论曲线缓存路径 `{stem}.theo.jsonl`（派生物，可删）。"""
+def _theo_path_for(ledger: Path, sha: str) -> Path:
+    """账本路径 + 策略 sha → 理论曲线缓存路径 `{stem}.{sha}.theo.jsonl`（派生物，可删）。
+
+    sha 键控（DEFECT-3 修复）：同一账本文件被多策略（多 sha）共享时，各策略的
+    理论缓存互不污染。sha 正常是 LL.formula_sha 的 6 位十六进制（天然文件名安全），
+    仍统一做非字母数字替换以防记录里带脏 sha。旧版 `{stem}.theo.jsonl`（无 sha 段）
+    文件一律视为不可用被忽略（不会读到也不会覆写），需要时按新名自动重生成。
+    """
     p = Path(ledger)
-    return p.with_name(p.stem + ".theo.jsonl")
+    safe_sha = re.sub(r"[^A-Za-z0-9]", "_", str(sha or ""))
+    return p.with_name(f"{p.stem}.{safe_sha}.theo.jsonl")
 
 
 def _write_theo_cache(path: Path, rows: list[dict], cost_rate: float) -> None:
@@ -271,8 +285,10 @@ def recompute_theo(source, symbol, tf, formula, *,
     返回 (rows, None)；rows 结构同 derive_rows。任何失败（源不可用/拉取异常/
     未知周期等）返回 ([], reason 字符串)，绝不抛出、绝不写缓存。源静默截断
     历史（首根窗口切片 < live_signal._min_bars()）同样按失败拒绝，防止退化
-    缓存污染新鲜度判定。成功后写
-    `{stem}.theo.jsonl` 原子缓存；缓存写失败仅降级为「下次重算」，不影响返回。
+    缓存污染新鲜度判定。成功后写 `{stem}.{sha}.theo.jsonl` 原子缓存（sha 键控，
+    多策略共享账本互不污染；旧版无 sha 的 {stem}.theo.jsonl 被忽略）；写盘前与
+    既有缓存按 bar_ts 合并去重（同键保留本次新值），增量扩窗不清旧行。
+    缓存写失败仅降级为「下次重算」，不影响返回。
 
     性能：O(窗口 bar 数 × LOOKBACK bar VM)，调用方（B5）必须限制请求跨度。
     """
@@ -323,8 +339,19 @@ def recompute_theo(source, symbol, tf, formula, *,
             raise RuntimeError(f"窗口 {start_ts}..{end_ts} 内无可用 bar")
         rows = derive_rows(recs, tf=tf, cost_rate=cost_rate)
         lp = LL.ledger_path(source, symbol, tf, ledger_dir=ledger_dir)
+        tp = _theo_path_for(lp, sha)
         try:
-            _write_theo_cache(_theo_path_for(lp), rows, cost_rate)
+            # 合并既有缓存与本次重算：同 bar_ts 保留本次新行，单边保留 → 增量扩窗不清旧。
+            merged: dict[int, dict] = {}
+            for old in (load_theo_cache(tp) or []):
+                try:
+                    merged[int(old["bar_ts"])] = old
+                except (KeyError, TypeError, ValueError):
+                    continue
+            for r in rows:
+                merged[int(r["bar_ts"])] = r
+            ordered = [merged[ts] for ts in sorted(merged)]
+            _write_theo_cache(tp, ordered, cost_rate)
         except OSError:
             pass  # 缓存是派生物：写失败不回退结果，下次按 mtime 判定重算
         return rows, None

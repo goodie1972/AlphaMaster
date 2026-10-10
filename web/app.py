@@ -1207,6 +1207,17 @@ _LEDGER_CSV_COLUMNS = (
 )
 _DEFAULT_COST_RATE = 0.0003    # 与 config.Config.COST_RATE 同值，读不到时兜底
 
+# CSV 公式注入中和（OWASP）：以这些字符开头的字符串单元格会被电子表格当作
+# 公式/命令执行（=SUM()、@HYPERLINK()、+、-、TAB/CR 触发拼接解析）。
+_CSV_INJECTION_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(v: Any) -> Any:
+    """危险前缀的字符串单元格加单引号前缀（标准 mitigation）；数值/None 原样。"""
+    if isinstance(v, str) and v[:1] in _CSV_INJECTION_PREFIXES:
+        return "'" + v
+    return v
+
 
 def _ledger_fail(op: str, exc: BaseException) -> dict[str, Any]:
     """台账端点统一失败出口：HTTP 200 + error 文本（spec §6 不 500）。
@@ -1342,7 +1353,7 @@ def _ledger_theo_rows(scope: dict[str, Any], cost_rate: float) -> tuple[list[dic
     if start is None or anchor is None:
         return [], "账本为空"
     ledger = scope["path"]
-    theo = LS._theo_path_for(ledger)
+    theo = LS._theo_path_for(ledger, scope["sha"] or "")
     if LS.theo_is_fresh(ledger, theo, cost_rate):
         cached = LS.load_theo_cache(theo)
         rows: list[dict] = []
@@ -1399,7 +1410,10 @@ def api_ledger_watches() -> dict[str, Any]:
                 "records": len(recs),
                 "corrupt_lines": corrupt,
                 "last_bar_ts": int(last.bar_ts) if last is not None else None,
-                "has_theo_cache": LS._theo_path_for(p).exists(),
+                "has_theo_cache": any(
+                    q.name.startswith(f"{p.stem}.") and q.name.endswith(".theo.jsonl")
+                    and q.name != f"{p.stem}.theo.jsonl"      # 旧版无 sha 文件不计
+                    for q in files),  # 任一 sha 键控缓存（{stem}.{sha}.theo.jsonl）存在即为有
                 "size_bytes": p.stat().st_size,
             })
         return {"watches": out, "ledger_dir": str(root)}
@@ -1561,7 +1575,7 @@ def api_ledger_export(watch_id: str, days: int = 30, sha: str | None = None):
         for r, row in zip(recs, rows):
             data = asdict(r)
             data["pnl"] = row["pnl"]
-            writer.writerow([data[c] for c in _LEDGER_CSV_COLUMNS])
+            writer.writerow([_csv_safe(data[c]) for c in _LEDGER_CSV_COLUMNS])
         filename = f'{scope["watch_id"]}_{days}d.csv'
         return Response(
             content=buf.getvalue().encode("utf-8"),

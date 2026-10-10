@@ -10,6 +10,7 @@ import os
 import time
 
 import web.ledger_stats as LS
+import web.live_ledger as LL
 from web.data_sources.base import bars_to_raw_dict
 from strategy_manager.live_signal import evaluate_signal
 
@@ -17,6 +18,8 @@ from strategy_manager.live_signal import evaluate_signal
 # 全部 token 在 model_core.vocab 词表内；合成 sine bar（1001 根，>=800 warm-up）
 # 上 evaluate_signal 实测 state=="ok"、position 非退化值。
 FORMULA = [25, 81, 61, 103, 93, 104, 31, 115]
+# theo 缓存按 {stem}.{sha}.theo.jsonl 键控（sha = LL.formula_sha(FORMULA)）。
+SHA = LL.formula_sha(FORMULA)
 
 
 class _B:
@@ -121,7 +124,7 @@ def test_theo_cache_roundtrip_and_freshness(tmp_path, monkeypatch):
     assert why is None
     assert all(r["position"] is not None for r in theo)  # 顺带钉住 ok 路径
 
-    theo_path = tmp_path / "fake_BTCUSDT_1h.theo.jsonl"  # {stem}.theo.jsonl
+    theo_path = tmp_path / f"fake_BTCUSDT_1h.{SHA}.theo.jsonl"  # {stem}.{sha}.theo.jsonl
     assert theo_path.exists()
     assert LS.theo_is_fresh(ledger, theo_path, 0.001) is True
     assert LS.theo_is_fresh(ledger, theo_path, 0.002) is False  # 成本口径变了 → 失效
@@ -151,7 +154,7 @@ def test_insufficient_history_source_refuses_cache(tmp_path, monkeypatch):
     assert why is not None
     assert "历史 bar 不足" in why
     assert f"（1/{required}）" in why  # 首根切片 1 根 vs 阈值（不硬编码 800）
-    assert not (tmp_path / "fake_BTCUSDT_1h.theo.jsonl").exists()
+    assert not list(tmp_path.glob("*.theo.jsonl"))         # 任何键控名都不许写
 
 
 def test_load_theo_cache_tolerant(tmp_path):
@@ -178,7 +181,7 @@ def test_load_theo_cache_tolerant(tmp_path):
 
 
 def test_recompute_failure_returns_reason_and_no_cache(tmp_path, monkeypatch):
-    theo_path = tmp_path / "fake_BTCUSDT_1h.theo.jsonl"
+    theo_path = tmp_path / f"fake_BTCUSDT_1h.{SHA}.theo.jsonl"
 
     def boom(kind):
         raise RuntimeError("源不可用")

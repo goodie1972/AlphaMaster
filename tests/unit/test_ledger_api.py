@@ -278,7 +278,7 @@ def test_curve_theo_real_chain_joins_by_bar_ts(tmp_path, monkeypatch):
     assert summary["theo_available"] is True and summary["theo_reason"] is None
     assert summary["records"] == 2
     assert summary["completeness"] == pytest.approx(1.0)   # 2 条 ÷ 源 2 根收盘 bar
-    assert (tmp_path / "okx_BTCUSDT_1d.theo.jsonl").exists()
+    assert (tmp_path / f"okx_BTCUSDT_1d.{SHA}.theo.jsonl").exists()
 
     curve = client.get("/api/ledger/curve",
                        params={"watch_id": "okx_BTCUSDT_1d", "days": 1}).json()["curve"]

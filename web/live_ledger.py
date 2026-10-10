@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import math
 import os
 import re
 import threading
@@ -79,20 +80,95 @@ def append_record(record: LedgerRecord, *, ledger_dir: Path | None = None) -> bo
     return True
 
 
+# 逐字段类型白名单（spec §5.2）：读侧校验/强转，任一线失败即整行计入 corrupt 并跳过，
+# 防止一行错类型/NaN 数据（json.loads 接受 NaN/Infinity 字面量）毒化全部下游统计。
+_FLOAT_FIELDS = ("ts", "close", "factor_value", "position", "strength")  # 有限 float 或 None
+_STR_FIELDS = ("source", "symbol", "timeframe", "strategy_sha", "direction")  # str 直存，标量强转
+
+
+def _coerce_bar_ts(v):
+    """bar_ts 必须可从有限数值 int() 化：bool/NaN/inf/非数值 str/容器 → None（拒）。"""
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        return None
+    try:
+        f = float(v)
+    except ValueError:  # 非数值字符串
+        return None
+    if not math.isfinite(f):  # NaN / ±inf 字面量
+        return None
+    return int(f)
+
+
+def _coerce_float(v):
+    """float 字段：None 原样放行；有限数值（含数值字符串）→ float；其余 → (拒, False)。"""
+    if v is None:
+        return None, True
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        return None, False
+    try:
+        f = float(v)
+    except ValueError:
+        return None, False
+    if not math.isfinite(f):
+        return None, False
+    return f, True
+
+
+def _coerce_str(v):
+    """字符串字段：str 原样；非 bool 数值标量 str() 强转（如 strategy_file 派生数字段）；
+    其余（dict/list/None/bool）→ None（拒）。内容原样存证，不做语义校验。"""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return str(v)
+    return None
+
+
+def _line_to_record(obj) -> "LedgerRecord | None":
+    """整行字段级校验：任一必填字段缺失/类型不合 → None（调用方计 corrupt）。"""
+    if not isinstance(obj, dict):
+        return None
+    fields = LedgerRecord.__dataclass_fields__
+    if not set(fields) <= set(obj):  # 缺必填字段 → 与原 TypeError 语义一致
+        return None
+    kwargs = {}
+    for k in _STR_FIELDS:
+        s = _coerce_str(obj.get(k))
+        if s is None:
+            return None
+        kwargs[k] = s
+    for k in _FLOAT_FIELDS:
+        f, ok = _coerce_float(obj.get(k))
+        if not ok:
+            return None
+        kwargs[k] = f
+    bar_ts = _coerce_bar_ts(obj.get("bar_ts"))
+    if bar_ts is None:
+        return None
+    kwargs["bar_ts"] = bar_ts
+    return LedgerRecord(**kwargs)
+
+
 def read_records(path: Path) -> tuple[list[LedgerRecord], int]:
     """逐行容错读取：返回 (记录列表, corrupt_lines)。
 
-    未知字段经 __dataclass_fields__ 白名单过滤；缺字段/坏 JSON 行计入 corrupt。
-    文件不存在或整体读失败时返回 ([], 0)，绝不抛出。
+    未知字段经 __dataclass_fields__ 白名单过滤；缺字段/坏 JSON/字段类型不合法
+    （如 bar_ts="abc"、position=NaN —— dataclass 无运行时校验，读侧单点补齐）
+    一律计入 corrupt 并跳过该行，绝不入库。
+    文件不存在或整体读失败时返回 ([], 0)，绝不抛出；非 UTF-8 字节按
+    errors="replace" 解码后交给逐行 corrupt 计数处理（契约：永不抛）。
     注：读者可能把写者半刷新的末行瞬时计为 corrupt（spec §6 半行损坏=容错设计）；
     追加模式整行写入保证下次读取该行完整可见。
     """
-    fields = set(LedgerRecord.__dataclass_fields__)
     recs: list[LedgerRecord] = []
     corrupt = 0
+    p = Path(path)
     try:
-        text = Path(path).read_text(encoding="utf-8")
-    except OSError:
+        try:
+            text = p.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            text = p.read_bytes().decode("utf-8", errors="replace")
+    except (OSError, UnicodeError):
         return recs, corrupt
     for line in text.splitlines():
         if not line.strip():
@@ -102,13 +178,11 @@ def read_records(path: Path) -> tuple[list[LedgerRecord], int]:
         except ValueError:  # json.JSONDecodeError 是 ValueError 子类
             corrupt += 1
             continue
-        if not isinstance(obj, dict):
+        rec = _line_to_record(obj)
+        if rec is None:
             corrupt += 1
             continue
-        try:
-            recs.append(LedgerRecord(**{k: v for k, v in obj.items() if k in fields}))
-        except TypeError:  # 缺必填字段等
-            corrupt += 1
+        recs.append(rec)
     return recs, corrupt
 
 
