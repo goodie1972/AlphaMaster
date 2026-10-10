@@ -1,17 +1,30 @@
-"""实盘台账统计纯函数（spec §5.5）。
+"""实盘台账统计纯函数（spec §5.5）+ 理论曲线懒算（spec §5.4）。
 
 derive_rows：把 LedgerRecord 序列按相邻性规则展开为逐 bar 收益行。
 compute_stats：对行序列聚合胜率/盈亏比/年化/Sortino/MDD 等统计。
+recompute_theo：同段离线重算理论仓位序列并经 derive_rows 展开（复用同一套
+收益数学）；theo_is_fresh/load_theo_cache 管理 .theo.jsonl 派生缓存。
 
-约束：纯函数、无 IO；不 import torch（Sortino 公式镜像
-model_core/backtest.py MT5Backtest._sortino，用纯 Python population std 实现）。
+性能告诫（spec §5.4 决策⑥）：整段重算是 O(窗口 bar 数 × _THEO_LOOKBACK bar
+VM 运行) 的懒算，缓存按账本 mtime 失效 —— 调用方（B5 API 层）必须限制请求
+时段跨度；本模块不做增量优化。
+
+约束：统计部分纯函数、无 IO；theo 部分做数据源拉取与缓存 IO，但任何失败
+都只回 reason 字符串、绝不抛出（台账失败不得中断信号评估主链路的延伸原则）。
+不 import torch 本体（evaluate_signal/bars_to_raw_dict 的 torch 依赖是既有链路）。
 周期字符串只做内部查表归一，绝不改写传出的 tf 值（各域原样约束）。
 """
 from __future__ import annotations
 
+import json
 import math
+import os
+from pathlib import Path
 
-from strategy_manager.live_signal import min_exposure
+import web.live_ledger as LL
+from strategy_manager.live_signal import evaluate_signal, min_exposure
+from web.data_sources.base import bars_to_raw_dict
+from web.data_sources.factory import get_source  # noqa: F401 —— 测试 monkeypatch 本模块属性
 
 # realtime 域记法（数字在前）；"1M"=月 与 "1m"=分钟 精确区分，不做整体 lower()。
 _TF_SECONDS: dict[str, int] = {
@@ -75,6 +88,8 @@ def derive_rows(records, *, tf: str, cost_rate: float) -> list[dict]:
     ret=close_next/close-1、turnover=|pos_next-pos|、pnl=pos*ret-turnover*cost；
     否则（含末条无 next）missing=True，ret/turnover/pnl 均 None。
     close<=0 或非有限视为不可计算，同样 missing=True（防除零）。
+    position 为 None（理论重算中 state!="ok" 的 bar）→ 该行 missing=True，
+    绝不参与 ret/pnl 数学。
     """
     tf_s = _tf_seconds(tf)
     recs = sorted(records, key=lambda r: int(r.bar_ts))
@@ -86,7 +101,8 @@ def derive_rows(records, *, tf: str, cost_rate: float) -> list[dict]:
                "pnl": None, "missing": True}
         if i + 1 < n:
             nxt = recs[i + 1]
-            if int(nxt.bar_ts) - int(cur.bar_ts) == tf_s:
+            if (int(nxt.bar_ts) - int(cur.bar_ts) == tf_s
+                    and cur.position is not None and nxt.position is not None):
                 c0, c1 = float(cur.close), float(nxt.close)
                 if c0 > 0.0 and math.isfinite(c0) and math.isfinite(c1):
                     pos = float(cur.position)
@@ -200,3 +216,167 @@ def compute_stats(rows, cost_rate, *, tf: str,
             "annualized": annualized, "sortino": sortino,
             "max_drawdown": max_drawdown, "live_bars": len(rows),
             "theoretical_bars": theoretical_bars}
+
+
+# ---------------------------------------------------------------------------
+# 理论曲线懒算 + 缓存（spec §5.4）
+# ---------------------------------------------------------------------------
+
+# 理论重算的单 bar 评估回看上限 = 1000，取自 realtime_manager._N_BARS 的同值口径：
+# 特征 warm-up 200（_NORM_WINDOW）+ VM 滚动归一化窗口 500 + 余量（实盘评估拉 1000 根、
+# evaluate_signal 要求 >=800 根才出 state=ok）。短窗口直接评估会因 warm-up 不足失真，
+# 故重算窗口前必须先多带 _THEO_LOOKBACK 根历史。
+_THEO_LOOKBACK = 1000
+
+# live/theo 仓位分叉判定的最小差（浮点噪声容差）。
+_DIVERGENCE_EPS = 1e-6
+
+
+def _theo_path_for(ledger: Path) -> Path:
+    """账本路径 → 理论曲线缓存路径 `{stem}.theo.jsonl`（派生物，可删）。"""
+    p = Path(ledger)
+    return p.with_name(p.stem + ".theo.jsonl")
+
+
+def _write_theo_cache(path: Path, rows: list[dict], cost_rate: float) -> None:
+    """原子写缓存（tmp+os.replace）；每行 {bar_ts, position, close, cost_rate}。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps({"bar_ts": r["bar_ts"], "position": r["position"],
+                                    "close": r["close"], "cost_rate": cost_rate},
+                                   ensure_ascii=False) + "\n")
+        os.replace(tmp, path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def recompute_theo(source, symbol, tf, formula, *,
+                   start_ts, end_ts, cost_rate,
+                   ledger_dir=None) -> tuple[list[dict], str | None]:
+    """离线重算 [start_ts, end_ts] 的理论仓位序列（spec §5.4）。
+
+    一次 fetch `span_bars + _THEO_LOOKBACK + 2` 根历史（保证窗口首根也有满
+    LOOKBACK  warm-up），对窗口内每根 bar 在切片 bars[k-LOOKBACK:k+1] 上调用
+    真实 evaluate_signal（与实盘同一计算链 → 口径恒等式成立）；state!="ok"
+    的行 position=None。产出先合成 LedgerRecord，再原样过 derive_rows ——
+    收益数学与实盘账本共用一份实现，绝不重复。
+
+    返回 (rows, None)；rows 结构同 derive_rows。任何失败（源不可用/拉取异常/
+    未知周期等）返回 ([], reason 字符串)，绝不抛出、绝不写缓存。成功后写
+    `{stem}.theo.jsonl` 原子缓存；缓存写失败仅降级为「下次重算」，不影响返回。
+
+    性能：O(窗口 bar 数 × LOOKBACK bar VM)，调用方（B5）必须限制请求跨度。
+    """
+    try:
+        tf_s = _tf_seconds(tf)
+        formula = [int(t) for t in formula]
+        start_ts, end_ts = int(start_ts), int(end_ts)
+        if end_ts < start_ts:
+            raise ValueError("end_ts 早于 start_ts")
+        src = get_source(str(source))
+        need = (end_ts - start_ts) // tf_s + _THEO_LOOKBACK + 2
+        bars = src.fetch_bars(str(symbol), tf, need, drop_forming=True)
+        if not bars:
+            raise RuntimeError("未获取到 K 线")
+        sha = LL.formula_sha(formula)
+        recs: list[LL.LedgerRecord] = []
+        for idx, b in enumerate(bars):
+            ts = int(b.ts)
+            if ts < start_ts or ts > end_ts:
+                continue
+            window = bars[max(0, idx - _THEO_LOOKBACK): idx + 1]
+            res = evaluate_signal(formula, bars_to_raw_dict(window),
+                                  require_closed=False)
+            ok = res.get("state") == "ok"
+            recs.append(LL.LedgerRecord(
+                ts=float(ts), bar_ts=ts, source=str(source), symbol=str(symbol),
+                timeframe=tf, strategy_sha=sha,
+                factor_value=res.get("factor_value") if ok else None,
+                position=res.get("position") if ok else None,
+                direction=res.get("direction", "") if ok else "",
+                strength=res.get("strength", 0.0) if ok else 0.0,
+                close=float(b.close)))
+        if not recs:
+            raise RuntimeError(f"窗口 {start_ts}..{end_ts} 内无可用 bar")
+        rows = derive_rows(recs, tf=tf, cost_rate=cost_rate)
+        lp = LL.ledger_path(source, symbol, tf, ledger_dir=ledger_dir)
+        try:
+            _write_theo_cache(_theo_path_for(lp), rows, cost_rate)
+        except OSError:
+            pass  # 缓存是派生物：写失败不回退结果，下次按 mtime 判定重算
+        return rows, None
+    except Exception as exc:  # noqa: BLE001 —— spec §6：任何故障只回原因
+        return [], f"数据源拉取失败: {exc}"
+
+
+def load_theo_cache(path) -> list[dict] | None:
+    """容错读取理论缓存：文件缺失/任一行损坏 → None（调用方触发重算）。"""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    rows: list[dict] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            return None
+        if not isinstance(obj, dict) or "bar_ts" not in obj:
+            return None
+        rows.append(obj)
+    return rows
+
+
+def theo_is_fresh(ledger_path, theo_path, cost_rate) -> bool:
+    """缓存新鲜判定：theo mtime >= ledger mtime 且首行 cost_rate 与请求一致。
+
+    跨度覆盖检查归调用方（B5）；账本不存在时 mtime 视为 0（theo 在即新鲜）。
+    """
+    lp, tp = Path(ledger_path), Path(theo_path)
+    try:
+        theo_mtime = tp.stat().st_mtime
+        ledger_mtime = lp.stat().st_mtime if lp.exists() else 0.0
+    except OSError:
+        return False
+    if theo_mtime < ledger_mtime:
+        return False
+    rows = load_theo_cache(tp)
+    if not rows:
+        return False
+    try:
+        return float(rows[0].get("cost_rate")) == float(cost_rate)
+    except (TypeError, ValueError):
+        return False
+
+
+def align_divergence(live_rows, theo_rows) -> list[int]:
+    """按 bar_ts 对齐 live/theo 行序列，返回仓位分叉（|Δposition| > 1e-6）的 bar_ts。
+
+    任一侧 position 为 None → 不参与分叉；单边缺失的 bar_ts 是数据缺口
+    （由完整率/theo_missing 处理），不算分叉。
+    """
+    theo_by_ts: dict[int, object] = {}
+    for r in theo_rows or []:
+        if r.get("bar_ts") is not None:
+            theo_by_ts[int(r["bar_ts"])] = r.get("position")
+    out: list[int] = []
+    for r in live_rows or []:
+        if r.get("bar_ts") is None:
+            continue
+        ts = int(r["bar_ts"])
+        lp = r.get("position")
+        tp = theo_by_ts.get(ts)
+        if lp is None or ts not in theo_by_ts or tp is None:
+            continue
+        if abs(float(lp) - float(tp)) > _DIVERGENCE_EPS:
+            out.append(ts)
+    return sorted(out)
