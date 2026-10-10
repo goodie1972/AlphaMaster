@@ -1,10 +1,13 @@
 """FastAPI application for AlphaMaster training UI."""
 from __future__ import annotations
 
+import csv
+import io
 import json
 import sys
 import time
 import traceback
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +53,8 @@ from web.backtest_manager import backtest_manager
 from web.realtime_manager import realtime_manager
 from web.data_sources.factory import list_sources
 from strategy_manager.live_signal import min_exposure
+import web.ledger_stats as LS
+import web.live_ledger as LL
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 BACKTEST_OUTPUT_DIR = ROOT / "backtest_output"
@@ -1186,9 +1191,371 @@ def api_realtime_feishu_test(req: FeishuTestRequest) -> dict[str, Any]:
     return {"ok": True, "message": msg}
 
 
+# ─────────────────────────────────────────────────────────────────────
+# 实盘信号台账 API（spec §5.6）
+#
+# 总原则（spec §6）：台账是观测者 —— 这五个端点任何故障一律 200 + {"error": 原因}，
+# 绝不 500，前端直接把原因显示成角标/提示。
+# ─────────────────────────────────────────────────────────────────────
+
+_LEDGER_DAYS_MIN = 1
+_LEDGER_DAYS_MAX = 3650        # 跨度上限：理论重算是 O(窗口 bar × 1001 bar VM) 懒算
+_LEDGER_LIMIT_MAX = 5000
+_LEDGER_CSV_COLUMNS = (
+    "ts", "bar_ts", "source", "symbol", "timeframe", "strategy_sha",
+    "factor_value", "position", "direction", "strength", "close", "pnl",
+)
+_DEFAULT_COST_RATE = 0.0003    # 与 config.Config.COST_RATE 同值，读不到时兜底
+
+
+def _ledger_fail(op: str, exc: BaseException) -> dict[str, Any]:
+    """台账端点统一失败出口：HTTP 200 + error 文本（spec §6 不 500）。
+
+    ValueError 是用户可触发的输入/目录问题，只 warn；其余按异常记错误日志。
+    """
+    if isinstance(exc, ValueError):
+        logger.warning("[ledger] %s 输入/数据不可用: %s", op, exc)
+    else:
+        log_error(f"[ledger] {op} failed", exc)
+    return {"error": str(exc)}
+
+
+def _ledger_cost_rate() -> float:
+    """调用时从 Config 读 COST_RATE（口径同 live_signal._min_trade_exposure）。"""
+    try:
+        from config import Config
+
+        return float(getattr(Config, "COST_RATE", _DEFAULT_COST_RATE))
+    except Exception:  # noqa: BLE001
+        return _DEFAULT_COST_RATE
+
+
+def _ledger_root() -> Path:
+    """LEDGER_DIR 必须每次调用时读模块属性（测试 monkeypatch 才生效）。"""
+    return Path(LL.LEDGER_DIR)
+
+
+def _ledger_stem_meta(stem: str) -> tuple[str, str, str]:
+    """账本文件名 stem → (source, symbol, tf)：首段 source、末段 tf、中间 symbol。
+
+    只在账本没有任何记录（取不到记录字段）时兜底用；有记录时一律以记录字段为准。
+    """
+    parts = stem.split("_")
+    if len(parts) < 3:
+        return "", "", ""
+    return parts[0], "_".join(parts[1:-1]), parts[-1]
+
+
+def _ledger_resolve(watch_id: str) -> Path:
+    """watch_id → 账本路径。
+
+    watch_id 是会被拼成文件名的用户输入，因此不做拼接式猜测：先拒绝路径分隔与穿越，
+    再与 LEDGER_DIR 目录清单里的真实文件名精确比对（只有实际存在的 `{watch_id}.jsonl`
+    才可用）。`.theo.jsonl` 是派生缓存、`strategy_index.json` 是索引，都不作为账本暴露。
+    """
+    wid = (watch_id or "").strip()
+    if not wid or "/" in wid or "\\" in wid or ".." in wid:
+        raise ValueError(f"非法 watch_id: {watch_id!r}")
+    if wid.endswith(".theo"):
+        raise ValueError(f"非法 watch_id（理论曲线缓存不是账本）: {watch_id!r}")
+    root = _ledger_root()
+    try:
+        names = {p.name for p in root.iterdir() if p.is_file()}
+    except OSError as exc:
+        raise ValueError(f"台账目录不可用: {root}（{exc.strerror or exc}）") from None
+    name = f"{wid}.jsonl"
+    if name not in names:
+        raise ValueError(f"账本不存在: {wid}")
+    return root / name
+
+
+def _ledger_scope(watch_id: str, days: int | None, sha: str | None) -> dict[str, Any]:
+    """定位账本 → days 截窗（以末条 bar_ts 为锚）→ sha 段过滤，返回共用统计上下文。
+
+    days=None 表示不截窗（/records 全量分页）；sha 缺省取窗口内最新段的 sha。
+    """
+    path = _ledger_resolve(watch_id)
+    if days is not None:
+        days = int(days)
+        if days < _LEDGER_DAYS_MIN or days > _LEDGER_DAYS_MAX:
+            raise ValueError(f"days 需在 {_LEDGER_DAYS_MIN}..{_LEDGER_DAYS_MAX} 之间")
+    recs, corrupt = LL.read_records(path)
+    recs.sort(key=lambda r: int(r.bar_ts))        # 读的是写入顺序，统计按 bar_ts 时序
+    source, symbol, tf = _ledger_stem_meta(path.stem)
+    anchor = None
+    if recs:
+        source, symbol, tf = recs[-1].source, recs[-1].symbol, recs[-1].timeframe
+        anchor = int(recs[-1].bar_ts)
+    start = anchor - days * 86400 if anchor is not None and days is not None else None
+    window = recs if start is None else [r for r in recs if int(r.bar_ts) >= start]
+    active_sha = sha or (window[-1].strategy_sha if window else None)
+    # sha 过滤在 derive_rows 之前：跨段相邻本就无收益意义（spec §5.5 相邻性规则），
+    # 代价是段边界那一根的 pnl 记 missing —— spec §5.5「分段统计」明确接受。
+    seg = [r for r in window if active_sha is None or r.strategy_sha == active_sha]
+    return {
+        "path": path, "watch_id": path.stem, "source": source, "symbol": symbol,
+        "timeframe": tf, "corrupt_lines": corrupt, "records_all": len(recs),
+        "window": window, "seg": seg, "sha": active_sha,
+        "start_ts": start, "anchor_ts": anchor, "days": days,
+    }
+
+
+def _theo_rows_from_cache(cache_rows: list[dict], scope: dict[str, Any],
+                          cost_rate: float) -> list[dict]:
+    """`.theo.jsonl` 行（bar_ts/position/close/cost_rate）→ 复用 derive_rows 出 pnl。
+
+    缓存只存仓位与收盘价（B4 口径），收益数学仍由 ledger_stats 单点实现，
+    这里只做形状还原，绝不另起一套 pnl 公式。
+    """
+    recs = [
+        LL.LedgerRecord(
+            ts=float(r["bar_ts"]), bar_ts=int(r["bar_ts"]),
+            source=scope["source"], symbol=scope["symbol"],
+            timeframe=scope["timeframe"], strategy_sha="",
+            factor_value=0.0,
+            position=None if r.get("position") is None else float(r["position"]),
+            direction="", strength=0.0, close=float(r["close"]),
+        )
+        for r in cache_rows
+    ]
+    return LS.derive_rows(recs, tf=scope["timeframe"], cost_rate=cost_rate)
+
+
+def _ledger_theo_rows(scope: dict[str, Any], cost_rate: float) -> tuple[list[dict], str | None]:
+    """理论曲线行（spec §5.4 懒算）：新鲜且覆盖窗口的缓存优先，否则按需重算。
+
+    返回 (窗口内 theo 行, None) 或 ([], reason)。theo_is_fresh 只看 mtime+cost_rate，
+    跨度覆盖由本调用方检查（B4 ruling）；缓存形状异常按不新鲜处理。
+    """
+    start, anchor = scope["start_ts"], scope["anchor_ts"]
+    if not scope["seg"]:
+        return [], "窗口内无实盘记录"
+    if start is None or anchor is None:
+        return [], "账本为空"
+    ledger = scope["path"]
+    theo = LS._theo_path_for(ledger)
+    if LS.theo_is_fresh(ledger, theo, cost_rate):
+        cached = LS.load_theo_cache(theo)
+        rows: list[dict] = []
+        if cached is not None:
+            try:
+                rows = _theo_rows_from_cache(cached, scope, cost_rate)
+            except (TypeError, ValueError, KeyError):
+                rows = []           # 缓存形状不对 → 落到重算分支
+        # 跨度覆盖检查（B4 ruling 留给调用方）：缓存首根必须就在窗口起点那一根上
+        # （窗口按 days*86400 截，tf 整除一天时天然对齐；容差一整个 bar 覆盖
+        #  起点落在两根之间的周期，如 1w/1M）。首根更晚 = 上一次请求的窗口更短，
+        #  缓存不覆盖本窗口 → 重算。
+        tf_s = LS._tf_seconds(scope["timeframe"])
+        rows = [r for r in rows if start <= int(r["bar_ts"]) <= anchor]
+        if rows and int(rows[0]["bar_ts"]) < start + tf_s:
+            return rows, None
+    entry = LL.load_strategy_index(_ledger_root()).get(scope["sha"] or "")
+    formula = entry.get("formula") if isinstance(entry, dict) else None
+    if not formula:
+        return [], "公式索引缺失"
+    fresh, reason = LS.recompute_theo(
+        scope["source"], scope["symbol"], scope["timeframe"], formula,
+        start_ts=start, end_ts=anchor, cost_rate=cost_rate,
+        ledger_dir=_ledger_root(),
+    )
+    if reason is not None:
+        return [], reason
+    return [r for r in fresh if start <= int(r["bar_ts"]) <= anchor], None
+
+
+@app.get("/api/ledger/watches")
+def api_ledger_watches() -> dict[str, Any]:
+    """账本文件清单（含已删 watch 的历史账，spec §5.6/§6）。"""
+    try:
+        root = _ledger_root()
+        try:
+            files = sorted(p for p in root.iterdir() if p.is_file())
+        except OSError:
+            files = []             # 目录还没建：空清单，不是错误
+        out: list[dict[str, Any]] = []
+        for p in files:
+            if not p.name.endswith(".jsonl") or p.name.endswith(".theo.jsonl"):
+                continue
+            recs, corrupt = LL.read_records(p)
+            source, symbol, tf = _ledger_stem_meta(p.stem)
+            last = recs[-1] if recs else None
+            if last is not None:
+                source, symbol, tf = last.source, last.symbol, last.timeframe
+            out.append({
+                "watch_id": p.stem,
+                "source": source,
+                "symbol": symbol,
+                "timeframe": tf,
+                "records": len(recs),
+                "corrupt_lines": corrupt,
+                "last_bar_ts": int(last.bar_ts) if last is not None else None,
+                "has_theo_cache": LS._theo_path_for(p).exists(),
+                "size_bytes": p.stat().st_size,
+            })
+        return {"watches": out, "ledger_dir": str(root)}
+    except Exception as exc:  # noqa: BLE001
+        return _ledger_fail("watches", exc)
+
+
+@app.get("/api/ledger/summary")
+def api_ledger_summary(watch_id: str, days: int = 30, sha: str | None = None) -> dict[str, Any]:
+    """统计卡数据：records/win_rate/profit_factor/annualized/sortino/max_drawdown
+    + corrupt_lines + 完整率 + 理论可用状态（spec §5.5/§5.6）。
+
+    completeness = 窗口记录数 ÷ max(记录数, 同窗口源收盘 bar 数)，源不可用 → null。
+    """
+    try:
+        cost_rate = _ledger_cost_rate()
+        scope = _ledger_scope(watch_id, days, sha)
+        live_rows = LS.derive_rows(scope["seg"], tf=scope["timeframe"], cost_rate=cost_rate)
+        stats = LS.compute_stats(live_rows, cost_rate, tf=scope["timeframe"])
+        theo_rows, theo_reason = _ledger_theo_rows(scope, cost_rate)
+        n = len(scope["seg"])
+        completeness = None
+        if theo_reason is None and n:
+            completeness = n / max(n, len(theo_rows))
+        divergence = LS.align_divergence(live_rows, theo_rows) if theo_reason is None else []
+        return {
+            "watch_id": scope["watch_id"],
+            "source": scope["source"],
+            "symbol": scope["symbol"],
+            "timeframe": scope["timeframe"],
+            "days": days,
+            "sha": scope["sha"],
+            "window_start_ts": scope["start_ts"],
+            "window_end_ts": scope["anchor_ts"],
+            "records": n,
+            "corrupt_lines": scope["corrupt_lines"],
+            "completeness": completeness,
+            "theo_available": theo_reason is None,
+            "theo_reason": theo_reason,
+            "theo_bars": len(theo_rows),
+            "divergence_count": len(divergence),
+            "divergence_bars": divergence[:200],
+            **stats,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return _ledger_fail("summary", exc)
+
+
+@app.get("/api/ledger/curve")
+def api_ledger_curve(watch_id: str, days: int = 30, sha: str | None = None) -> dict[str, Any]:
+    """实盘/理论累计曲线叠图序列：[{bar_ts, cum_live, cum_theo, theo_missing}]。
+
+    cum_* 为 derive_rows 的 pnl 前缀和（missing 行不前移）；theo 侧按 bar_ts join，
+    缺口记 theo_missing（spec §5.4/§6）。
+    """
+    try:
+        cost_rate = _ledger_cost_rate()
+        scope = _ledger_scope(watch_id, days, sha)
+        live_rows = LS.derive_rows(scope["seg"], tf=scope["timeframe"], cost_rate=cost_rate)
+        theo_rows, theo_reason = _ledger_theo_rows(scope, cost_rate)
+        theo_cum: dict[int, float] = {}
+        acc = 0.0
+        for r in sorted(theo_rows, key=lambda x: int(x["bar_ts"])):
+            if not r.get("missing") and r.get("pnl") is not None:
+                acc += float(r["pnl"])
+            theo_cum[int(r["bar_ts"])] = acc
+        curve: list[dict[str, Any]] = []
+        acc = 0.0
+        for r in live_rows:                # derive_rows 已按 bar_ts 升序
+            if not r["missing"] and r["pnl"] is not None:
+                acc += float(r["pnl"])
+            ts = int(r["bar_ts"])
+            curve.append({
+                "bar_ts": ts,
+                "cum_live": acc,
+                "cum_theo": theo_cum.get(ts),
+                "theo_missing": ts not in theo_cum,
+            })
+        return {
+            "watch_id": scope["watch_id"],
+            "timeframe": scope["timeframe"],
+            "days": days,
+            "sha": scope["sha"],
+            "theo_available": theo_reason is None,
+            "theo_reason": theo_reason,
+            "curve": curve,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return _ledger_fail("curve", exc)
+
+
+@app.get("/api/ledger/records")
+def api_ledger_records(
+    watch_id: str,
+    days: int | None = None,
+    direction: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """明细分页：账本原字段 + 派生 pnl（相邻才有值）。
+
+    days 省略即全量历史；本端点不按 sha 过滤（明细要看完整流水），
+    排序新→旧，便于前端表格直接展示。
+    """
+    try:
+        cost_rate = _ledger_cost_rate()
+        scope = _ledger_scope(watch_id, days, None)
+        recs = scope["window"]
+        rows = LS.derive_rows(recs, tf=scope["timeframe"], cost_rate=cost_rate)
+        # derive_rows 内部 stable sort 同键同序 → 与已排序的 recs 逐下标对齐
+        items = [
+            {**asdict(r), "pnl": row["pnl"], "missing": row["missing"]}
+            for r, row in zip(recs, rows)
+        ]
+        if direction:
+            want = str(direction).upper()
+            items = [x for x in items if str(x.get("direction") or "").upper() == want]
+        total = len(items)
+        lim = max(1, min(int(limit), _LEDGER_LIMIT_MAX))
+        off = max(0, int(offset))
+        page = list(reversed(items))[off:off + lim]
+        return {
+            "watch_id": scope["watch_id"],
+            "days": days,
+            "direction": direction,
+            "total": total,
+            "limit": lim,
+            "offset": off,
+            "records": page,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return _ledger_fail("records", exc)
+
+
+@app.get("/api/ledger/export")
+def api_ledger_export(watch_id: str, days: int = 30, sha: str | None = None):
+    """CSV 下载：账本原始行 + 派生 pnl 列（spec §5.6）。失败同样 200 + error。"""
+    from fastapi.responses import Response
+
+    try:
+        cost_rate = _ledger_cost_rate()
+        scope = _ledger_scope(watch_id, days, sha)
+        recs = scope["seg"]
+        rows = LS.derive_rows(recs, tf=scope["timeframe"], cost_rate=cost_rate)
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(_LEDGER_CSV_COLUMNS)
+        for r, row in zip(recs, rows):
+            data = asdict(r)
+            data["pnl"] = row["pnl"]
+            writer.writerow([data[c] for c in _LEDGER_CSV_COLUMNS])
+        filename = f'{scope["watch_id"]}_{days}d.csv'
+        return Response(
+            content=buf.getvalue().encode("utf-8"),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _ledger_fail("export", exc)
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
+
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
