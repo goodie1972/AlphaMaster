@@ -1221,7 +1221,16 @@ def _ledger_fail(op: str, exc: BaseException) -> dict[str, Any]:
 
 
 def _ledger_cost_rate() -> float:
-    """调用时从 Config 读 COST_RATE（口径同 live_signal._min_trade_exposure）。"""
+    """调用时取成本口径（spec §5.4）：web settings 的 bt_commission_pct + bt_slippage_pct，
+    口径与 02 回测链同源（api_backtest_start 读同名键，百分数 → /100）。
+    键缺失/不可解析才兜底 Config.COST_RATE。绝不打印 settings 内容（文件含凭据）。"""
+    try:
+        settings = load_settings()
+        commission = float(settings.get("bt_commission_pct"))
+        slippage = float(settings.get("bt_slippage_pct"))
+        return (commission + slippage) / 100.0
+    except (TypeError, ValueError):
+        pass
     try:
         from config import Config
 
@@ -1414,7 +1423,18 @@ def api_ledger_summary(watch_id: str, days: int = 30, sha: str | None = None) ->
         n = len(scope["seg"])
         completeness = None
         if theo_reason is None and n:
-            completeness = n / max(n, len(theo_rows))
+            # 跨度覆盖判定沿用 _ledger_theo_rows 缓存分支同一口径：theo 首根必须落在
+            # 窗口起点一根 bar 容差内。theo 有行但起步晚于窗口（源截断/退市）→ 覆盖
+            # 不足，完整率报 null 而非 1.0（记录数÷max 的分母口径此时失真）。
+            covered = False
+            if theo_rows and scope["start_ts"] is not None:
+                tf_s = LS._tf_seconds(scope["timeframe"])
+                theo_first = min(int(r["bar_ts"]) for r in theo_rows)
+                covered = theo_first < int(scope["start_ts"]) + tf_s
+            else:
+                covered = not theo_rows
+            if covered:
+                completeness = n / max(n, len(theo_rows))
         divergence = LS.align_divergence(live_rows, theo_rows) if theo_reason is None else []
         return {
             "watch_id": scope["watch_id"],

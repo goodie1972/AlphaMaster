@@ -175,6 +175,53 @@ def test_summary_missing_sha_index_entry_marks_theo_unavailable(tmp_path, monkey
     assert body["completeness"] is None
 
 
+# ── 终评 F3：cost_rate 必须与 02 回测同源 = (bt_commission_pct + bt_slippage_pct)/100 ──
+def test_summary_cost_rate_sourced_from_settings(tmp_path, monkeypatch):
+    """settings 有键 → (0.05+0.02)/100=0.0007；缺键 → 兜底 Config.COST_RATE=0.0003。
+    选换手 1.0 的两根 bar，让 pnl（及 annualized）对 cost_rate 敏感、两口径可区分。"""
+    monkeypatch.setattr(LL, "LEDGER_DIR", tmp_path)
+    # 行0：pos=1.0→0.0（turnover=1.0），ret=101/100-1=0.01 → pnl=0.01-cost
+    _write(tmp_path, [_rec(0, pos=1.0, close=100.0), _rec(3600, pos=0.0, close=101.0)])
+    monkeypatch.setattr("web.app.load_settings",
+                        lambda: {"bt_commission_pct": 0.05, "bt_slippage_pct": 0.02})
+    s = client.get("/api/ledger/summary",
+                   params={"watch_id": "okx_BTCUSDT_1h", "days": 1}).json()
+    monkeypatch.setattr("web.app.load_settings", lambda: {})
+    f = client.get("/api/ledger/summary",
+                   params={"watch_id": "okx_BTCUSDT_1h", "days": 1}).json()
+    ppy = 2 / (3600 / (365.25 * 86400.0))          # 密度口径：2 行 / 1h 跨度
+    assert s["annualized"] == pytest.approx((0.01 - 0.0007) * ppy, rel=1e-6)
+    assert f["annualized"] == pytest.approx((0.01 - 0.0003) * ppy, rel=1e-6)
+    assert s["annualized"] != f["annualized"]
+
+
+def test_summary_cost_rate_falls_back_on_unparseable_settings(tmp_path, monkeypatch):
+    """键存在但不可解析 → 兜底 Config.COST_RATE，绝不抛出、绝不打印 settings。"""
+    monkeypatch.setattr(LL, "LEDGER_DIR", tmp_path)
+    _write(tmp_path, [_rec(0, pos=1.0, close=100.0), _rec(3600, pos=0.0, close=101.0)])
+    monkeypatch.setattr("web.app.load_settings",
+                        lambda: {"bt_commission_pct": "abc", "bt_slippage_pct": 0.02})
+    body = client.get("/api/ledger/summary",
+                      params={"watch_id": "okx_BTCUSDT_1h", "days": 1}).json()
+    ppy = 2 / (3600 / (365.25 * 86400.0))
+    assert body["annualized"] == pytest.approx((0.01 - 0.0003) * ppy, rel=1e-6)
+
+
+# ── 终评 F5：theo 有行但跨度覆盖不足（源截断/退市）→ completeness=null 而非 1.0 ──
+def test_summary_completeness_null_on_partial_theo_coverage(tmp_path, monkeypatch):
+    monkeypatch.setattr(LL, "LEDGER_DIR", tmp_path)
+    LL.ensure_strategy_index(FORMULA, "best_BTCUSDT_1h.json", "v1", ledger_dir=tmp_path)
+    _write(tmp_path, [_rec(0, pos=1.0, close=100.0), _rec(3600, pos=1.0, close=101.0)])
+    # 假重算：只回窗口末根一根 theo（首根 3600 ≫ start+tf_s → 跨度覆盖不足）
+    partial = [{"bar_ts": 3600, "close": 101.0, "position": 0.5, "ret": None,
+                "turnover": None, "pnl": None, "missing": True}]
+    monkeypatch.setattr(LS, "recompute_theo", lambda *a, **k: (partial, None))
+    body = client.get("/api/ledger/summary",
+                      params={"watch_id": "okx_BTCUSDT_1h", "days": 1}).json()
+    assert body["theo_available"] is True and body["theo_bars"] == 1
+    assert body["completeness"] is None            # 覆盖不足 → null（此前恒为 1.0）
+
+
 def test_summary_days_range_is_200_error(tmp_path, monkeypatch):
     """跨度上限保护：theo 重算是 O(窗口 bar × 1001 bar VM) 懒算（B4 性能告诫）。"""
     monkeypatch.setattr(LL, "LEDGER_DIR", tmp_path)

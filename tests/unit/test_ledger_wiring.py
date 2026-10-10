@@ -55,9 +55,10 @@ def test_restart_recovers_last_ledger_bar_ts(tmp_path, monkeypatch):
     import json as _json
 
     monkeypatch.setattr(LL, "LEDGER_DIR", tmp_path)
-    # 预置账本：已有 bar_ts=8200 的记录
+    # 预置账本：已有 bar_ts=8200 的记录（sha 与本 watch 公式一致，锚点按 sha 归组）
     rec = LL.LedgerRecord(ts=1.0, bar_ts=8200, source="tradingview", symbol="BTCUSDT",
-                          timeframe="1h", strategy_sha="abcdef", factor_value=1.0,
+                          timeframe="1h", strategy_sha=LL.formula_sha([1]),
+                          factor_value=1.0,
                           position=0.5, direction="up", strength=0.5, close=100.0)
     assert LL.append_record(rec) is True
 
@@ -75,6 +76,45 @@ def test_restart_recovers_last_ledger_bar_ts(tmp_path, monkeypatch):
     try:
         task = mgr._add_task_internal("tradingview", "BTCUSDT", "1h", str(sf), persist=False)
         assert task.last_ledger_bar_ts == 8200
+    finally:
+        mgr.stop()
+        mgr._executor.shutdown(wait=False)
+
+
+def test_restart_anchor_is_per_sha(tmp_path, monkeypatch):
+    """终评 F1①：账本文件被同 pair+tf 的多策略共享（spec §5.2 按 sha 去重）。
+    恢复锚点只能取「本 sha」记录的最大 bar_ts——文件末行属于别的 sha 时不能被继承，
+    否则后加策略会永久跳过自己尚未写过的 bar。"""
+    import json as _json
+
+    monkeypatch.setattr(LL, "LEDGER_DIR", tmp_path)
+    sha_b = LL.formula_sha([1])   # 正在重建的 watch 的策略
+    sha_a = LL.formula_sha([2])   # 同 pair+tf 的另一个策略
+
+    def _r(bar_ts, sha):
+        return LL.LedgerRecord(ts=float(bar_ts), bar_ts=bar_ts, source="tradingview",
+                               symbol="BTCUSDT", timeframe="1h", strategy_sha=sha,
+                               factor_value=1.0, position=0.5, direction="up",
+                               strength=0.5, close=100.0)
+
+    # 交错写入：文件末行是 A 的 7200；B 自己的最大 bar_ts 只有 3600
+    for rec in (_r(0, sha_b), _r(3600, sha_b), _r(7200, sha_a)):
+        assert LL.append_record(rec) is True
+
+    sf = tmp_path / "btc_1h.json"
+    sf.write_text(_json.dumps({"formula": [1], "vocab_version": "v"}), encoding="utf-8")
+
+    class _FakeSrc:
+        label = "TV"
+
+        def supported_timeframes(self):
+            return ["1h"]
+
+    monkeypatch.setattr("web.realtime_manager.get_source", lambda kind: _FakeSrc())
+    mgr = RealtimeManager()
+    try:
+        task = mgr._add_task_internal("tradingview", "BTCUSDT", "1h", str(sf), persist=False)
+        assert task.last_ledger_bar_ts == 3600      # B 的锚点，而非全文件末行 7200
     finally:
         mgr.stop()
         mgr._executor.shutdown(wait=False)

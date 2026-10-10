@@ -81,3 +81,71 @@ def test_add_watch_new_named_matching_tf_no_warn(tmp_path):
         mgr.clear()
         mgr.stop()
         mgr._executor.shutdown(wait=False)
+
+
+# ── 终评 F2：tf 不一致告警按「秒数等价」判定，两种记法域（H1/M30… 与 1h/30m…）互认 ──
+
+def _mk_mgr_with_fake_src(monkeypatch, tfs):
+    from web.realtime_manager import RealtimeManager
+
+    class _FakeSrc:
+        label = "TV"
+
+        def supported_timeframes(self):
+            return list(tfs)
+
+    monkeypatch.setattr("web.realtime_manager.get_source", lambda kind: _FakeSrc())
+    return RealtimeManager()
+
+
+def test_strategy_H1_watch_1h_is_equivalent_no_warn(tmp_path, monkeypatch):
+    """主流真实场景：策略按 parquet 记法标 H1、监控按 realtime 记法配 1h → 同周期，不应告警。"""
+    p = tmp_path / "best_XAUUSD_H1.json"
+    p.write_text(
+        json.dumps({"symbol": "XAUUSD", "timeframe": "H1", "formula": [1]}),
+        encoding="utf-8",
+    )
+    mgr = _mk_mgr_with_fake_src(monkeypatch, ["1h", "4h"])
+    try:
+        task = mgr._add_task_internal("tradingview", "XAUUSD", "1h", str(p), persist=False)
+        assert task.warn == ""
+    finally:
+        mgr.clear()
+        mgr.stop()
+        mgr._executor.shutdown(wait=False)
+
+
+def test_true_tf_mismatch_warns_with_original_strings(tmp_path, monkeypatch):
+    """H1(3600s) vs 4h(14400s) 真不一致 → 告警，且文案原样打印两侧原始字符串。"""
+    p = tmp_path / "best_XAUUSD_H1.json"
+    p.write_text(
+        json.dumps({"symbol": "XAUUSD", "timeframe": "H1", "formula": [1]}),
+        encoding="utf-8",
+    )
+    mgr = _mk_mgr_with_fake_src(monkeypatch, ["1h", "4h"])
+    try:
+        task = mgr._add_task_internal("tradingview", "XAUUSD", "4h", str(p), persist=False)
+        assert task.warn != ""
+        assert "H1" in task.warn and "4h" in task.warn   # 原样，不做大小写/记法转换
+    finally:
+        mgr.clear()
+        mgr.stop()
+        mgr._executor.shutdown(wait=False)
+
+
+def test_unparseable_tf_warns(tmp_path, monkeypatch):
+    """任一侧记法无法折算秒数 → 保守告警（宁亮不误撤）。"""
+    p = tmp_path / "best_XAUUSD_xyz.json"
+    p.write_text(
+        json.dumps({"symbol": "XAUUSD", "timeframe": "xyz", "formula": [1]}),
+        encoding="utf-8",
+    )
+    mgr = _mk_mgr_with_fake_src(monkeypatch, ["1h"])
+    try:
+        task = mgr._add_task_internal("tradingview", "XAUUSD", "1h", str(p), persist=False)
+        assert task.warn != ""
+        assert "xyz" in task.warn and "1h" in task.warn
+    finally:
+        mgr.clear()
+        mgr.stop()
+        mgr._executor.shutdown(wait=False)

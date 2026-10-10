@@ -53,6 +53,21 @@ def _cadence_for(tf: str) -> int:
     return _CADENCE.get(tf, _DEFAULT_CADENCE)
 
 
+def _tf_seconds_equivalent(tf: str) -> int | None:
+    """周期记法 → bar 秒数；两种记法域都认：realtime 式（1h/30m/15m/1d/1m，见 _TF_SECONDS）
+    和 parquet 式（字母在前：H1/M30/M15/D1/W1）。不可解析 → None（调用方保守处理）。
+    仅供 warn 判定做秒数等价比较，绝不改写任何对外展示的原始字符串。"""
+    t = str(tf).strip()
+    seconds = _TF_SECONDS.get(t)
+    if seconds is not None:
+        return seconds
+    if len(t) >= 2 and t[0].isalpha() and t[1:].isdigit() and int(t[1:]) >= 1:
+        unit = {"m": 60, "h": 3600, "d": 86400, "w": 604800}.get(t[0].lower())
+        if unit is not None:
+            return unit * int(t[1:])
+    return None
+
+
 def _next_bar_close_at(last_bar_open: int | None, timeframe: str, now: float | None = None) -> int | None:
     """根据最后已收盘 bar 的开盘时间，推算下次收盘（即下次信号更新）的 Unix 秒。
 
@@ -220,7 +235,11 @@ class RealtimeManager:
                     w["source"], w["symbol"], w["timeframe"], w["strategy_file"],
                     persist=False,
                 )
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[realtime] 持久化监控项无法恢复，已跳过 {w!r}: {exc}",
+                    flush=True,
+                )
                 continue
         if self._tasks:
             self._ensure_thread()
@@ -268,11 +287,13 @@ class RealtimeManager:
             warn = f"词表版本不符（{meta['vocab_version']} vs {VOCAB_VERSION}），信号可能失真"
         elif meta.get("symbol") and meta["symbol"] != symbol:
             warn = f"该因子为 {meta['symbol']} 训练，跨品种运行仅供参考"
-        elif (
-            meta.get("timeframe")
-            and str(meta["timeframe"]).strip() != timeframe
+        elif meta.get("timeframe") and (
+            # 秒数等价判定：H1≡1h、M30≡30m、D1≡1d；任一侧无法折算或秒数真不等才告警。
+            # 告警文案仍原样打印两侧字符串（不做大小写/记法转换）。
+            (_s := _tf_seconds_equivalent(meta["timeframe"])) is None
+            or (_w := _tf_seconds_equivalent(timeframe)) is None
+            or _s != _w
         ):
-            # 周期字符串按各域原样比较（不做大小写/写法转换）
             warn = (
                 f"该因子按 {meta['timeframe']} 周期训练，"
                 f"与监控周期 {timeframe} 不一致，信号可能失真"
@@ -294,9 +315,14 @@ class RealtimeManager:
             warn=warn,
             next_due=0.0,
         )
-        # 重启恢复：从既有台账末行取回去重锚点，避免重复写最后一根 bar；失败不打断建 watch
+        # 重启恢复：锚点按 sha 归组——账本文件被同 pair+tf 的多策略共享（spec §5.2），
+        # 只取本策略 sha 记录的最大 bar_ts，避免继承别的策略的锚点永久跳过自己的首根 bar；
+        # 失败不打断建 watch
         try:
-            task.last_ledger_bar_ts = LL.last_bar_ts(LL.ledger_path(source, symbol, timeframe))
+            _recs, _ = LL.read_records(LL.ledger_path(source, symbol, timeframe))
+            _sha = LL.formula_sha(task.formula)
+            _mine = [int(r.bar_ts) for r in _recs if r.strategy_sha == _sha]
+            task.last_ledger_bar_ts = max(_mine) if _mine else None
         except Exception as exc:  # noqa: BLE001
             print(
                 f"[ledger] 恢复 last_ledger_bar_ts 失败（忽略）: {exc}",
