@@ -115,3 +115,8 @@ secrets/
 *.key
 credentials*.json
 local_settings*.json
+
+# ── SDD/台账运行产物（本计划新增）─────────────────────────────────
+live_ledger/
+.superpowers/
+.qoder-credits/
