@@ -17,25 +17,46 @@ from web.progress import (
 )
 from web.settings import load_settings
 
-_BEST_NAME_RE = re.compile(r"^best_(.+)\.json$", re.IGNORECASE)
+_BEST_NAME_RE = re.compile(r"^best_(.+)_[A-Za-z0-9]{1,4}\.json$", re.IGNORECASE)
 _STRATEGY_EXPORT_RE = re.compile(
     r"^strategy_(.+)_step(\d+)(?:_score([\d.]+))?\.json$",
     re.IGNORECASE,
 )
+_TF_PART_RE = re.compile(r"^(?P<sym>.+)_(?P<tf>[A-Za-z0-9]{1,4})$")
 
 
-def strategy_path_for_symbol(symbol: str) -> Path:
-    return STRATEGIES_DIR / f"best_{symbol}.json"
+def parse_best_stem(stem: str) -> tuple[str, str] | None:
+    """解析 best_{symbol}_{tf} 文件名主干；旧命名（无周期）返回 None。"""
+    if not stem.lower().startswith("best_"):
+        return None
+    m = _TF_PART_RE.match(stem[len("best_"):])
+    return (m.group("sym"), m.group("tf")) if m else None
 
 
-def symbol_from_strategy_path(path: Path) -> str | None:
-    name = path.name
-    m = _BEST_NAME_RE.match(name)
+def strategy_path_for_symbol(symbol: str, timeframe: str) -> Path:
+    tf = (timeframe or "").strip()
+    if not tf or not re.fullmatch(r"[A-Za-z0-9]{1,4}", tf):
+        raise ValueError(f"无效周期，拒绝写无周期策略名: {timeframe!r}")
+    return STRATEGIES_DIR / f"best_{symbol}_{tf}.json"
+
+
+def tf_from_best_name(path: Path) -> str | None:
+    """从 best_{symbol}_{tf}.json 文件名取周期；旧命名或非 best 文件返回 None。"""
+    m = _BEST_NAME_RE.match(path.name)
+    if not m:
+        return None
+    parsed = parse_best_stem(path.stem)
+    return parsed[1] if parsed else None
+
+
+def symbol_from_strategy_path(path: Path) -> tuple[str, str | None] | None:
+    """best_ 文件返回 (symbol, tf)；strategy_ 导出返回 (symbol, None)；否则 None。"""
+    parsed = parse_best_stem(path.stem)
+    if parsed:
+        return parsed
+    m = _STRATEGY_EXPORT_RE.match(path.name)
     if m:
-        return m.group(1)
-    m = _STRATEGY_EXPORT_RE.match(name)
-    if m:
-        return m.group(1)
+        return m.group(1), None
     return None
 
 
