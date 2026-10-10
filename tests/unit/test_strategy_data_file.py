@@ -68,9 +68,11 @@ def test_sync_best_writes_data_file(project: Path) -> None:
         encoding="utf-8",
     )
 
-    info = sf.sync_best_strategy_for_symbol("XAUUSD")
+    info = sf.sync_best_strategy_for_symbol("XAUUSD", "H1")
     assert info is not None
     assert info["data_file"] == str(parquet.resolve())
 
-    saved = json.loads(strat_path.read_text(encoding="utf-8"))
+    out_path = project / "strategies" / "best_XAUUSD_H1.json"
+    saved = json.loads(out_path.read_text(encoding="utf-8"))
     assert saved["data_file"] == str(parquet.resolve())
+    assert saved["timeframe"] == "H1"
