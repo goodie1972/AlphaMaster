@@ -21,6 +21,7 @@ from strategy_manager.live_signal import evaluate_signal, min_exposure
 from web.data_sources.base import bars_to_raw_dict
 from web.data_sources.factory import SOURCE_KINDS, get_source
 from web.settings import load_settings, save_settings
+from web.strategy_file import is_legacy_best_name
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -234,6 +235,9 @@ class RealtimeManager:
     def _add_task_internal(
         self, source: str, symbol: str, timeframe: str, strategy_file: str, persist: bool
     ) -> WatchTask:
+        # 旧命名 best_{symbol}.json（主干不含周期）直接拒绝，不读内容、不猜周期
+        if is_legacy_best_name(strategy_file or ""):
+            raise ValueError("旧命名策略不可用：文件名需含周期，请用新命名重新导出")
         source = (source or "").strip()
         symbol = (symbol or "").strip()
         timeframe = (timeframe or "").strip()
@@ -262,6 +266,15 @@ class RealtimeManager:
             warn = f"词表版本不符（{meta['vocab_version']} vs {VOCAB_VERSION}），信号可能失真"
         elif meta.get("symbol") and meta["symbol"] != symbol:
             warn = f"该因子为 {meta['symbol']} 训练，跨品种运行仅供参考"
+        elif (
+            meta.get("timeframe")
+            and str(meta["timeframe"]).strip() != timeframe
+        ):
+            # 周期字符串按各域原样比较（不做大小写/写法转换）
+            warn = (
+                f"该因子按 {meta['timeframe']} 周期训练，"
+                f"与监控周期 {timeframe} 不一致，信号可能失真"
+            )
 
         task = WatchTask(
             id=task_id,

@@ -151,7 +151,9 @@ def build_training_snapshot(symbol: str | None = None) -> dict[str, Any]:
     settings = load_settings()
 
     sym = (symbol or job.get("symbol") or "").strip()
-    timeframe = str(job.get("timeframe") or "").strip().upper()
+    # tf_raw：各域原样周期（与策略文件名 best_{symbol}_{tf} 同一取值），不做大小写转换
+    tf_raw = str(job.get("timeframe") or "").strip()
+    timeframe = tf_raw.upper()
 
     data_file = settings.get("last_data_file") or ""
     if data_file:
@@ -159,8 +161,10 @@ def build_training_snapshot(symbol: str | None = None) -> dict[str, Any]:
             info = inspect_parquet_file(data_file)
             if not sym:
                 sym = str(info.get("symbol") or "").strip()
+            if not tf_raw:
+                tf_raw = str(info.get("timeframe") or "").strip()
             if not timeframe:
-                timeframe = str(info.get("timeframe") or "").strip().upper()
+                timeframe = tf_raw.upper()
         except Exception:
             pass
 
@@ -169,7 +173,8 @@ def build_training_snapshot(symbol: str | None = None) -> dict[str, Any]:
     if not timeframe:
         timeframe = "H1"
 
-    progress = get_symbol_progress(sym)
+    # 周期未知时传 None：策略字段按设计置空，绝不回退读旧命名文件
+    progress = get_symbol_progress(sym, tf_raw or None)
     history = progress.history or {}
     curve = _training_curve(history, max_points=500)
 

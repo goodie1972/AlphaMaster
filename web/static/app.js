@@ -2112,9 +2112,9 @@ async function loadRtStrategies() {
   }
   rows.forEach((r) => {
     const score = r.best_score != null ? Number(r.best_score).toFixed(3) : "—";
-    const tf = r.timeframe ? ` ${r.timeframe}` : "";
+    const tf = r.timeframe || "—";
     opts.push(
-      `<option value="${escHtml(r.strategy_file)}" data-symbol="${escHtml(r.symbol || "")}">${escHtml(r.symbol)}${tf} · 分数 ${score}</option>`
+      `<option value="${escHtml(r.strategy_file)}" data-symbol="${escHtml(r.symbol || "")}">${escHtml(r.symbol || "—")} · ${escHtml(tf)} · 分数 ${score}</option>`
     );
   });
   const prev = sel.value;
@@ -2495,6 +2495,7 @@ function renderRealtimeGrid(watches) {
           ? `<div class="rt-msg">${escHtml(displayMsg)}</div>`
           : "";
       const sizeText = plain ? plain.size : "—";
+      const stratLabel = `${escHtml(w.strategy_symbol || "—")} · ${escHtml(w.strategy_timeframe || "—")}`;
       return `
     <div class="rt-card ${dirCls}" data-id="${escHtml(w.id)}">
       <button class="rt-remove" data-remove="${escHtml(w.id)}" title="移除监控">×</button>
@@ -2512,7 +2513,7 @@ function renderRealtimeGrid(watches) {
       </div>
       <div class="rt-meta">
         <span class="rt-meta-item">因子 <b>${factorText}</b></span>
-        <span class="rt-meta-item">${escHtml(w.strategy_name)}</span>
+        <span class="rt-meta-item" title="${escHtml(w.strategy_name)}">${stratLabel}</span>
       </div>
       <div class="rt-foot">
         <span class="rt-state ${w.state}">${RT_STATE_LABEL[w.state] || w.state}</span>

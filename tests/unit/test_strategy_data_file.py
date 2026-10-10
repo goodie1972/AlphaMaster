@@ -38,7 +38,8 @@ def test_inspect_strategy_fills_data_file_from_settings(project: Path) -> None:
     parquet.write_bytes(b"PAR1")
     save_settings({"last_data_file": str(parquet.resolve())})
 
-    strat_path = project / "strategies" / "best_XAUUSD.json"
+    # A4 起旧命名 best_XAUUSD.json 会被 inspect 拒绝（legacy_naming），种子文件用新命名
+    strat_path = project / "strategies" / "best_XAUUSD_H1.json"
     strat_path.write_text(
         json.dumps({"symbol": "XAUUSD", "formula": [1, 2, 3], "best_score": 1.5}),
         encoding="utf-8",

@@ -61,6 +61,15 @@ def symbol_from_strategy_path(path: Path) -> tuple[str, str | None] | None:
     return None
 
 
+def is_legacy_best_name(path: Path | str) -> bool:
+    """旧命名 best_{symbol}.json（best_ 前缀但主干不含周期）返回 True。
+
+    仅针对 best_ 前缀文件；strategy_ 导出与任意名文件不属于「旧命名」，返回 False。
+    """
+    stem = Path(path).stem
+    return stem.lower().startswith("best_") and parse_best_stem(stem) is None
+
+
 def _resolve_data_file_for_symbol(
     symbol: str,
     data_file: str | None,
@@ -124,6 +133,24 @@ def inspect_strategy_file(
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"文件不存在: {p}")
+
+    if is_legacy_best_name(p):
+        # 旧命名 best_{symbol}.json：不再兼容，返回错误码而非静默接受
+        return {
+            "error": "legacy_naming",
+            "strategy_file": str(p.resolve()),
+            "filename": p.name,
+            "symbol": "",
+            "timeframe": None,
+            "data_file": None,
+            "data_file_exists": False,
+            "mode": None,
+            "best_score": None,
+            "vocab_version": None,
+            "formula_decoded": None,
+            "valid": False,
+            "message": "旧命名策略不可用：文件名需含周期（best_品种_周期.json），请用新命名重新导出",
+        }
 
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
@@ -240,7 +267,8 @@ def sync_best_strategy_for_symbol(
     """
     tf = (timeframe or "").strip()
     if not tf:
-        for ckpt_path in checkpoint_glob(symbol):
+        # checkpoint_glob 按 mtime 升序；倒序遍历，优先取最新 checkpoint 的周期
+        for ckpt_path in reversed(checkpoint_glob(symbol)):
             try:
                 meta_tf = _load_checkpoint_meta(ckpt_path).get("timeframe")
             except Exception:  # 损坏的 ckpt 不应阻断 sync，跳过
