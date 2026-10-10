@@ -22,6 +22,7 @@ from web.data_sources.base import bars_to_raw_dict
 from web.data_sources.factory import SOURCE_KINDS, get_source
 from web.settings import load_settings, save_settings
 from web.strategy_file import is_legacy_best_name
+import web.live_ledger as LL
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -143,6 +144,7 @@ class WatchTask:
     factor_value: float | None = None
     bars_used: int | None = None
     last_bar_ts: int | None = None
+    last_ledger_bar_ts: int | None = None   # 已写入台账的最后一根收盘 bar（去重锚点）
     updated_at: float | None = None
     message: str = ""
     warn: str = ""
@@ -292,6 +294,14 @@ class RealtimeManager:
             warn=warn,
             next_due=0.0,
         )
+        # 重启恢复：从既有台账末行取回去重锚点，避免重复写最后一根 bar；失败不打断建 watch
+        try:
+            task.last_ledger_bar_ts = LL.last_bar_ts(LL.ledger_path(source, symbol, timeframe))
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[ledger] 恢复 last_ledger_bar_ts 失败（忽略）: {exc}",
+                flush=True,
+            )
         with self._lock:
             self._tasks[task_id] = task
             if persist:
@@ -405,6 +415,38 @@ class RealtimeManager:
                 # 已有上次方向且发生转折时推飞书（首次算出方向不打扰）
                 if prev_dir and new_dir and prev_dir != new_dir:
                     self._notify_direction_flip(task, prev_dir, new_dir)
+                # 台账：每根新收盘 bar 记一行；任何失败绝不打断信号评估主链路（spec §6）
+                try:
+                    bar_ts = int(last_ts)
+                    if task.last_ledger_bar_ts is None or bar_ts > task.last_ledger_bar_ts:
+                        sha = LL.ensure_strategy_index(
+                            task.formula, task.strategy_file, task.vocab_version or ""
+                        )
+                        rec = LL.LedgerRecord(
+                            ts=time.time(),
+                            bar_ts=bar_ts,
+                            source=task.source,
+                            symbol=task.symbol,
+                            timeframe=task.timeframe,
+                            strategy_sha=sha,
+                            factor_value=float(result["factor_value"]),
+                            position=float(result["position"]),
+                            direction=str(result["direction"]),
+                            strength=float(result["strength"]),
+                            close=float(bars[-1].close),
+                        )
+                        if LL.append_record(rec):
+                            task.last_ledger_bar_ts = bar_ts
+                        else:
+                            print(
+                                f"[ledger] 写入失败 bar_ts={bar_ts}（下个 tick 重试）",
+                                flush=True,
+                            )
+                except Exception as ledger_exc:  # noqa: BLE001
+                    print(
+                        f"[ledger] 台账异常（忽略，不影响信号）: {ledger_exc}",
+                        flush=True,
+                    )
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
             if task.source == "tradingview":
