@@ -605,33 +605,62 @@
         <span class="hud-corner tl"></span><span class="hud-corner tr"></span>
         <span class="hud-corner bl"></span><span class="hud-corner br"></span>
         <div class="panel-head">
-          <h2>信号明细</h2>
+          <h2>成交视图</h2>
           <span class="hint" id="ledgerTableHint">—</span>
         </div>
-        <div class="table-wrap">
-          <table class="bt-table" id="ledgerTable">
+        <div class="metric-grid" id="ledgerTradeStats" aria-label="交易口径汇总"></div>
+        <div class="launch-actions" id="ledgerViewTabs">
+          <button type="button" class="btn btn-primary" id="ledgerTabLiveBtn">成交列表（实盘）</button>
+          <button type="button" class="btn btn-secondary" id="ledgerTabTheoBtn">成交列表（回放）</button>
+          <button type="button" class="btn btn-secondary" id="ledgerTabBarsBtn">逐根明细</button>
+        </div>
+        <small class="field-hint" id="ledgerTradeHint"></small>
+        <div class="table-wrap" id="ledgerTradesWrap">
+          <table class="bt-table" id="ledgerTradesTable">
             <thead>
               <tr>
-                <th>Bar 时间</th>
                 <th>方向</th>
-                <th>把握</th>
-                <th>因子</th>
+                <th>进场时间</th>
+                <th>进场价</th>
                 <th>仓位</th>
-                <th>收盘</th>
-                <th>收益</th>
+                <th>出场时间</th>
+                <th>出场价</th>
+                <th>持仓根数</th>
+                <th>净收益</th>
                 <th>状态</th>
               </tr>
             </thead>
-            <tbody id="ledgerTableBody">
-              <tr class="empty-row"><td colspan="8">台账自添加 watch 起积累，服务重启不丢</td></tr>
+            <tbody id="ledgerTradesBody">
+              <tr class="empty-row"><td colspan="9">台账自添加 watch 起积累，服务重启不丢</td></tr>
             </tbody>
           </table>
         </div>
-        <div class="launch-actions">
-          <button type="button" class="btn btn-secondary" id="ledgerPrevBtn" disabled>上一页</button>
-          <button type="button" class="btn btn-secondary" id="ledgerNextBtn" disabled>下一页</button>
-          <span class="action-sep" aria-hidden="true"></span>
-          <a class="btn btn-secondary" id="ledgerCsv" href="#" hidden>导出 CSV</a>
+        <div id="ledgerBarsView" hidden>
+          <div class="table-wrap">
+            <table class="bt-table" id="ledgerTable">
+              <thead>
+                <tr>
+                  <th>Bar 时间</th>
+                  <th>方向</th>
+                  <th>把握</th>
+                  <th>因子</th>
+                  <th>仓位</th>
+                  <th>收盘</th>
+                  <th>收益</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody id="ledgerTableBody">
+                <tr class="empty-row"><td colspan="8">台账自添加 watch 起积累，服务重启不丢</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="launch-actions">
+            <button type="button" class="btn btn-secondary" id="ledgerPrevBtn" disabled>上一页</button>
+            <button type="button" class="btn btn-secondary" id="ledgerNextBtn" disabled>下一页</button>
+            <span class="action-sep" aria-hidden="true"></span>
+            <a class="btn btn-secondary" id="ledgerCsv" href="#" hidden>导出 CSV</a>
+          </div>
         </div>
       </section>
     </div><!-- /page-ledger -->
@@ -679,6 +708,6 @@
   </div>
 
   <script src="/static/bg.js?v=1"></script>
-  <script src="/static/app.js?v=62"></script>
+  <script src="/static/app.js?v=63"></script>
 </body>
 </html>

@@ -2638,12 +2638,18 @@ async function init() {
 // 实盘台账（04 页）
 // ═══════════════════════════════════════════════════════════════════
 let ledgerInited = false;
-let ledgerSeq = 0;          // summary/curve 请求序号：切换 watch/时间窗后丢弃过期响应
+let ledgerSeq = 0;          // summary/curve/trades 请求序号：切换 watch/时间窗后丢弃过期响应
 let ledgerRecordsSeq = 0;   // 明细列表独立序号（分页/方向筛选只重拉 records）
 let ledgerOffset = 0;       // 明细分页偏移
+let ledgerRecordsTotal = 0; // 最近一次 records 总数（切回逐根明细 tab 时重建分页 hint）
+let ledgerTradesLive = null;  // /api/ledger/trades?source=live 响应
+let ledgerTradesTheo = null;  // /api/ledger/trades?source=theo 响应（回放通道）
+let ledgerViewTab = "live";   // 04 页明细区子 tab："live" | "theo" | "bars"，默认成交列表（实盘）
 const LEDGER_PAGE_SIZE = 50;
 const LEDGER_EMPTY_TEXT = "台账自添加 watch 起积累，服务重启不丢";
 const LEDGER_DIR_CN = { LONG: "开多", SHORT: "开空", FLAT: "平仓" };
+const LEDGER_TRADE_STATUS_CN = { closed: "已平", open: "持仓中", broken: "断档平仓" };
+const LEDGER_THEO_REPLAY_HINT = "回放＝同计算链对完整历史的重算，非实盘成交";
 
 async function initLedger() {
   if (!ledgerInited) {
@@ -2664,6 +2670,13 @@ async function initLedger() {
       ledgerOffset += LEDGER_PAGE_SIZE;
       loadLedgerRecords();
     });
+    // 成交视图子 tab 切换（纯本地渲染，不重新拉数）
+    [["live", "ledgerTabLiveBtn"], ["theo", "ledgerTabTheoBtn"], ["bars", "ledgerTabBarsBtn"]]
+      .forEach(([name, id]) => {
+        const btn = $(id);
+        if (btn) btn.addEventListener("click", () => setLedgerViewTab(name));
+      });
+    setLedgerViewTab("live");
   }
   await loadLedger();
 }
@@ -2704,6 +2717,9 @@ async function loadLedger() {
     drawLedgerChart($("ledgerChart"), null);
     resetLedgerTable(`${LEDGER_EMPTY_TEXT}。`);
     renderLedgerCsv("", "", null);
+    ledgerTradesLive = null;
+    ledgerTradesTheo = null;
+    renderLedgerTrades();
     return;
   }
   sel.innerHTML = watches
@@ -2714,7 +2730,7 @@ async function loadLedger() {
   await loadLedgerData();
 }
 
-// 并发拉 summary/curve（records 独立分页，一并触发）
+// 并发拉 summary/curve + 成交双通道（records 独立分页，一并触发）
 async function loadLedgerData() {
   const watchId = ledgerWatchId();
   if (!watchId) {
@@ -2722,21 +2738,30 @@ async function loadLedgerData() {
     drawLedgerChart($("ledgerChart"), null);
     resetLedgerTable(`${LEDGER_EMPTY_TEXT}。`);
     renderLedgerCsv("", "", null);
+    ledgerTradesLive = null;
+    ledgerTradesTheo = null;
+    renderLedgerTrades();
     return;
   }
   const seq = ++ledgerSeq;
   const days = ledgerDaysVal();
   const q = `watch_id=${encodeURIComponent(watchId)}&days=${encodeURIComponent(days)}`;
   const fetchOpts = { silent: true, retries: 1 };
-  const [summary, curve] = await Promise.all([
+  const [summary, curve, tradesLive, tradesTheo] = await Promise.all([
     // 200+{"error"} 原样返回；422/网络错误由 fetchJSON 抛出（formatApiError 已处理 detail 数组）
     fetchJSON(`/api/ledger/summary?${q}`, fetchOpts).catch((e) => ({ error: e.message })),
     fetchJSON(`/api/ledger/curve?${q}`, fetchOpts).catch((e) => ({ error: e.message })),
+    // 成交视图双通道：theo 路失败（200+error）只在回放 tab 显示原因，不砸实盘区
+    fetchJSON(`/api/ledger/trades?${q}&source=live`, fetchOpts).catch((e) => ({ error: e.message })),
+    fetchJSON(`/api/ledger/trades?${q}&source=theo`, fetchOpts).catch((e) => ({ error: e.message })),
   ]);
   if (seq !== ledgerSeq) return; // 已切到更新的 watch/时间窗
+  ledgerTradesLive = tradesLive;
+  ledgerTradesTheo = tradesTheo;
   renderLedgerStats(summary, curve);
   drawLedgerChart($("ledgerChart"), curve);
   renderLedgerCsv(watchId, days, summary);
+  renderLedgerTrades();
   await loadLedgerRecords();
 }
 
@@ -2818,6 +2843,123 @@ function renderLedgerStats(summary, curve) {
   }
 }
 
+// bar_ts（秒）→ 本地时间文本；null →「—」。与逐根明细表同一格式化口径。
+function ledgerFmtTs(ts) {
+  return ts == null ? "—" : new Date(Number(ts) * 1000).toLocaleString();
+}
+
+// 子 tab 切换：成交列表（实盘）/ 成交列表（回放）/ 逐根明细。纯本地状态+重渲染。
+function setLedgerViewTab(name) {
+  ledgerViewTab = name;
+  const active = { live: "ledgerTabLiveBtn", theo: "ledgerTabTheoBtn", bars: "ledgerTabBarsBtn" };
+  Object.entries(active).forEach(([tab, id]) => {
+    const btn = $(id);
+    if (btn) btn.className = `btn ${tab === name ? "btn-primary" : "btn-secondary"}`;
+  });
+  const tradesWrap = $("ledgerTradesWrap");
+  const barsView = $("ledgerBarsView");
+  if (tradesWrap) tradesWrap.hidden = name === "bars";
+  if (barsView) barsView.hidden = name !== "bars";
+  renderLedgerTrades();
+  if (name === "bars") {
+    // 切回逐根明细：hint 恢复分页信息（renderLedgerTrades 在成交 tab 会占用该 hint）
+    const hintEl = $("ledgerTableHint");
+    if (hintEl) {
+      hintEl.textContent = ledgerRecordsTotal
+        ? `${ledgerOffset + 1}–${Math.min(ledgerOffset + LEDGER_PAGE_SIZE, ledgerRecordsTotal)} / 共 ${ledgerRecordsTotal} 条`
+        : "共 0 条";
+    }
+  }
+}
+
+// 成交视图渲染：按当前子 tab 显示对应通道（实盘/回放）的汇总卡 + 成交表。
+// 后端字符串（error/原因）一律走 escHtml；状态/方向只渲染本地白名单文案。
+function renderLedgerTrades() {
+  const body = $("ledgerTradesBody");
+  const statsEl = $("ledgerTradeStats");
+  const hintEl = $("ledgerTradeHint");
+  const tableHint = $("ledgerTableHint");
+  if (ledgerViewTab === "bars") {
+    // metric-grid 类自带 display:grid，hidden 属性会被压过 → 用 .hidden 工具类
+    if (statsEl) { statsEl.classList.add("hidden"); statsEl.innerHTML = ""; }
+    if (hintEl) { hintEl.hidden = true; hintEl.textContent = ""; }
+    return;
+  }
+  if (statsEl) statsEl.classList.remove("hidden");
+  if (hintEl) {
+    hintEl.hidden = false;
+    hintEl.textContent = ledgerViewTab === "theo"
+      ? `${LEDGER_THEO_REPLAY_HINT}；成交价＝信号 bar 收盘价，净收益已扣双边成本`
+      : "成交价＝信号 bar 收盘价（账本逐根记录切分）；净收益已扣双边成本";
+  }
+  const resp = ledgerViewTab === "theo" ? ledgerTradesTheo : ledgerTradesLive;
+  if (!resp) {
+    if (statsEl) statsEl.innerHTML = "";
+    if (body) body.innerHTML = `<tr class="empty-row"><td colspan="9">${escHtml(LEDGER_EMPTY_TEXT)}</td></tr>`;
+    if (tableHint) tableHint.textContent = "—";
+    return;
+  }
+  if (resp.error) {
+    // theo 路失败只落在回放 tab 内（实盘区不受牵连）；live 路失败同理
+    if (statsEl) {
+      statsEl.innerHTML = `<div class="metric-empty">${ledgerViewTab === "theo" ? "回放不可用" : "成交加载失败"}：${escHtml(resp.error)}</div>`;
+    }
+    if (body) body.innerHTML = `<tr class="empty-row"><td colspan="9">${ledgerViewTab === "theo" ? "回放不可用：" : "成交加载失败："}${escHtml(resp.error)}</td></tr>`;
+    if (tableHint) tableHint.textContent = "—";
+    return;
+  }
+  const s = resp.stats || {};
+  const fmtOr = (v, fn) => (ledgerNull(v) ? "—" : fn(Number(v)));
+  const cards = [
+    { label: "总笔数", value: fmtOr(s.trades_total, (v) => String(Math.round(v))), cls: "" },
+    { label: "已平", value: fmtOr(s.trades_closed, (v) => String(Math.round(v))), cls: "" },
+    { label: "胜率", value: fmtOr(s.win_rate, (v) => (v * 100).toFixed(1) + "%"), cls: "" },
+    { label: "盈亏比", value: fmtOr(s.profit_factor, METRIC_FMT.ratio), cls: "" },
+    { label: "平均每笔净收益", value: fmtOr(s.avg_net, (v) => fmtPct(v, 3)), cls: ledgerNull(s.avg_net) ? "" : (s.avg_net >= 0 ? "pos" : "neg") },
+    { label: "累计净收益", value: fmtOr(s.cum_net, (v) => fmtPct(v, 3)), cls: ledgerNull(s.cum_net) ? "" : (s.cum_net >= 0 ? "pos" : "neg") },
+    { label: "交易MDD", value: fmtOr(s.max_drawdown, (v) => "-" + (v * 100).toFixed(2) + "%"), cls: !ledgerNull(s.max_drawdown) && s.max_drawdown > 0 ? "neg" : "" },
+    { label: "持仓笔数", value: fmtOr(s.open_count, (v) => String(Math.round(v))), cls: "" },
+  ];
+  if (statsEl) {
+    statsEl.innerHTML = cards
+      .map((c) => `
+    <div class="metric-card ${c.cls}">
+      <div class="metric-label">${c.label}</div>
+      <div class="metric-value ${c.cls}">${c.value}</div>
+    </div>`)
+      .join("");
+  }
+  const trades = resp.trades || [];
+  if (body) {
+    if (!trades.length) {
+      body.innerHTML = `<tr class="empty-row"><td colspan="9">窗口内暂无成交（${ledgerViewTab === "theo" ? "回放" : "实盘"}序列无持仓段）</td></tr>`;
+    } else {
+      body.innerHTML = trades
+        .map((t) => {
+          const isLong = t.direction === "LONG";
+          const dirCls = isLong ? "pos" : "neg";
+          const netCls = Number.isFinite(t.net) ? (t.net >= 0 ? "pos" : "neg") : "";
+          const statusCn = LEDGER_TRADE_STATUS_CN[t.status] || escHtml(String(t.status ?? "—"));
+          return `<tr>
+            <td class="${dirCls}">${isLong ? "开多" : "开空"}</td>
+            <td>${escHtml(ledgerFmtTs(t.entry_ts))}</td>
+            <td>${ledgerNull(t.entry_close) ? "—" : Number(t.entry_close).toLocaleString()}</td>
+            <td>${ledgerNull(t.entry_position) ? "—" : fmtSigned(t.entry_position, 2)}</td>
+            <td>${escHtml(ledgerFmtTs(t.exit_ts))}</td>
+            <td>${ledgerNull(t.exit_close) ? "—" : Number(t.exit_close).toLocaleString()}</td>
+            <td>${ledgerNull(t.bars_held) ? "—" : String(Math.round(Number(t.bars_held)))}</td>
+            <td class="${netCls}">${ledgerNull(t.net) ? "—" : fmtPct(t.net, 3)}</td>
+            <td>${statusCn}</td>
+          </tr>`;
+        })
+        .join("");
+    }
+  }
+  if (tableHint) {
+    tableHint.textContent = `成交 ${trades.length} 笔 · 已平 ${Math.round(s.trades_closed ?? 0)} · 持仓 ${Math.round(s.open_count ?? 0)}`;
+  }
+}
+
 // 明细表：每页 50 条 + 上一页/下一页（新→旧，与 /records 排序一致）
 async function loadLedgerRecords() {
   const watchId = ledgerWatchId();
@@ -2845,13 +2987,14 @@ async function loadLedgerRecords() {
   if (!body) return;
   if (d.error) {
     body.innerHTML = `<tr class="empty-row"><td colspan="8">明细加载失败：${escHtml(d.error)}</td></tr>`;
-    if (hintEl) hintEl.textContent = "—";
+    if (hintEl && ledgerViewTab === "bars") hintEl.textContent = "—";
     if (prevBtn) prevBtn.disabled = true;
     if (nextBtn) nextBtn.disabled = true;
     return;
   }
   const recs = d.records || [];
   const total = d.total || 0;
+  ledgerRecordsTotal = total;
   if (!recs.length) {
     body.innerHTML = `<tr class="empty-row"><td colspan="8">${LEDGER_EMPTY_TEXT}。</td></tr>`;
   } else {
@@ -2874,7 +3017,7 @@ async function loadLedgerRecords() {
       })
       .join("");
   }
-  if (hintEl) {
+  if (hintEl && ledgerViewTab === "bars") {
     hintEl.textContent = total
       ? `${ledgerOffset + 1}–${Math.min(ledgerOffset + LEDGER_PAGE_SIZE, total)} / 共 ${total} 条`
       : "共 0 条";

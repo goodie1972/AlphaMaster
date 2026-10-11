@@ -226,6 +226,181 @@ def compute_stats(rows, cost_rate, *, tf: str,
 
 
 # ---------------------------------------------------------------------------
+# 成交视图：从逐 bar 行序列切交易（task C1 §1，只消费 derive_rows 行字段）
+# ---------------------------------------------------------------------------
+
+def _row_pos(row) -> tuple[str, float | None]:
+    """行 position 分类：("hold", v) 持仓行 / ("flat", 0.0) / ("none", None) / ("bad", None)。
+
+    position 为 None 或 0 或非有限/不可解析 → 不是持仓行（与 §1 起始行判定同口径）；
+    "bad"（非有限）按断档处理：仓位未知，无法确认平仓。
+    """
+    p = row.get("position")
+    if p is None:
+        return "none", None
+    try:
+        v = float(p)
+    except (TypeError, ValueError):
+        return "bad", None
+    if not math.isfinite(v):
+        return "bad", None
+    if v == 0.0:
+        return "flat", 0.0
+    return "hold", v
+
+
+def _float_or_none(v) -> float | None:
+    """行 close 等字段的安全浮点化：None/不可解析 → None（绝不抛）。"""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f
+
+
+def derive_trades(rows, cost_rate) -> list[dict]:
+    """从 derive_rows 行序列切成交交易（成交价=信号 bar 收盘价，同 derive_rows 口径）。
+
+    交易边界（§1，简化规则：在 rows 序列上顺序扫描，不再做 bar_ts 相邻性判定，
+    缺口中断一律交给行 missing 标志）：
+    - 一段交易 = 一段连续的符号相同的持仓行（position 非 None/非 0/有限）。
+    - 起始行 e：序列中无前序持仓行、或前一个有效 position 为 0/None/符号相反/
+      与 e 之间隔着 missing 行（缺口）。
+    - 结束：平仓（后一行 position 变 0/None）、反手（后一行符号相反，旧交易在此
+      闭合、该行同时是新交易进场行）、或持仓段被 missing 行打断（断档 broken）。
+
+    记账公式（只用行字段，与 derive_rows 恒等式见下）：
+    - gross = Σ pos_k × ret_k，k 取 e..h 中 missing=False 的行（断档行/末 bar 的
+      ret 为 None，天然不计 → open 交易「浮盈不含末 bar」）。
+    - cost = 进场 |pos_e|×cost_rate + 内部 Σ_{e≤k<h} |pos_{k+1}−pos_k|×cost_rate
+      + 出场 |pos_h|×cost_rate。出场费仅当平仓/反手发生（e..h 之后紧跟一行
+      position 变 0/None/反号）时收取；open（到序列末仍持仓）与 broken（被
+      missing 行打断）不收出场费——出场尚未/无法发生，浮亏浮盈如实反映。
+    - net = gross − cost。
+    - 出场价口径：closed 的 exit_ts/exit_close = 状态变化行的 bar_ts/close；
+      broken/open 的 exit_ts/exit_close = None。
+    - 恒等式：序列首行为平仓位（或首笔进场前有相邻平仓位）且各段内部无 missing
+      行时，Σ所有交易 net == Σ所有非 missing 行 pnl —— 进场费恰是前一平仓位行
+      的 turnover、出场费恰是末持仓行 turnover、反手行 turnover=出场+进场合一，
+      与 derive_rows 逐行扣费完全同构。序列第一行直接进场时进场费无对应记账行，
+      恒等式天然差一笔 |pos_e|×cost_rate（只文档化，不作断言）；broken/open
+      出场费口径不同同样不适用。
+
+    返回交易 dict 列表（时序升序）：
+    {direction:"LONG"|"SHORT", entry_ts:int, entry_close:float, exit_ts:int|None,
+     exit_close:float|None, entry_position:float, bars_held:int, gross:float,
+     cost:float, net:float, status:"closed"|"open"|"broken"}
+    """
+    c = float(cost_rate)
+    trades: list[dict] = []
+    n = len(rows)
+    cur: list[dict] = []   # 当前同向持仓段（含打断段的末根 missing 行）
+    sign = 0               # 当前段符号：1 多 / -1 空
+
+    def _finalize(status: str, exit_row: dict | None) -> None:
+        seg = cur
+        gross = 0.0
+        for r in seg:
+            if not r.get("missing") and r.get("ret") is not None:
+                gross += float(r["position"]) * float(r["ret"])
+        cost = abs(float(seg[0]["position"])) * c
+        for k in range(len(seg) - 1):
+            cost += abs(float(seg[k + 1]["position"]) - float(seg[k]["position"])) * c
+        if status == "closed":
+            cost += abs(float(seg[-1]["position"])) * c
+        trades.append({
+            "direction": "LONG" if sign > 0 else "SHORT",
+            "entry_ts": int(seg[0]["bar_ts"]),
+            "entry_close": _float_or_none(seg[0].get("close")),
+            "exit_ts": int(exit_row["bar_ts"]) if exit_row is not None else None,
+            "exit_close": _float_or_none(exit_row.get("close")) if exit_row is not None else None,
+            "entry_position": float(seg[0]["position"]),
+            "bars_held": len(seg),
+            "gross": gross,
+            "cost": cost,
+            "net": gross - cost,
+            "status": status,
+        })
+
+    for i, r in enumerate(rows):
+        kind, v = _row_pos(r)
+        missing = bool(r.get("missing"))
+        if not cur:
+            if kind == "hold":
+                cur = [r]
+                sign = 1 if v > 0 else -1
+                if missing:
+                    # 进场 bar 本身即断档行：孤段，末根→open，否则→broken
+                    _finalize("open" if i == n - 1 else "broken", None)
+                    cur, sign = [], 0
+            continue
+        same_dir = kind == "hold" and (v > 0) == (sign > 0)
+        if same_dir and not missing:
+            cur.append(r)
+            continue
+        if same_dir:
+            # 同向 missing 持仓行：并入本段末根后打断（断档/序列末）
+            cur.append(r)
+            _finalize("open" if i == n - 1 else "broken", None)
+            cur, sign = [], 0
+            continue
+        if kind == "bad":
+            # 仓位非有限：无法确认平仓，按断档收场
+            _finalize("broken", None)
+            cur, sign = [], 0
+            continue
+        if kind == "hold":
+            # 反手：旧交易在此闭合（出场费照收，§1 出场判据只看 position 变号），
+            # 该行同时是新交易进场行；若该行本身 missing 再按断档口径处理。
+            _finalize("closed", r)
+            cur = [r]
+            sign = 1 if v > 0 else -1
+            if missing:
+                _finalize("open" if i == n - 1 else "broken", None)
+                cur, sign = [], 0
+            continue
+        # flat / none：平仓（§1 出场判据「position 变 0/None」）
+        _finalize("closed", r)
+        cur, sign = [], 0
+    if cur:
+        _finalize("open", None)
+    return trades
+
+
+def trade_stats(trades) -> dict:
+    """交易口径汇总（task C1 §1）。空列表返回全 None/0 结构，绝不抛。
+
+    - trades_closed/status=="closed"（含反手）计数；open_count 同口径。
+    - win_rate：closed 中 net>0 占比（严格 >0，net==0 不算赢）；无 closed → None。
+    - profit_factor：Σ盈/|Σ亏|（closed 口径，严格 >0/<0 分组）；无亏损笔 → None，
+      只亏不赚 → 0.0。
+    - avg_net：closed 净收益均值（无 closed → None）；cum_net：全部交易 net 之和
+      （含 open/broken 浮亏浮盈，无交易 → None）。
+    - max_drawdown：按交易序列 cum 的峰谷差，复用 _max_drawdown（空序列 → 0.0）。
+    """
+    ts = list(trades or [])
+    closed = [t for t in ts if t.get("status") == "closed"]
+    open_count = sum(1 for t in ts if t.get("status") == "open")
+    if closed:
+        wins = sum(1 for t in closed if float(t["net"]) > 0)
+        win_rate: float | None = wins / len(closed)
+        avg_net: float | None = sum(float(t["net"]) for t in closed) / len(closed)
+    else:
+        win_rate = avg_net = None
+    profits = [float(t["net"]) for t in closed if float(t["net"]) > 0]
+    losses = [float(t["net"]) for t in closed if float(t["net"]) < 0]
+    profit_factor = None if not losses else sum(profits) / abs(sum(losses))
+    cum_net = sum(float(t["net"]) for t in ts) if ts else None
+    max_drawdown = _max_drawdown([float(t["net"]) for t in ts])
+    return {"trades_total": len(ts), "trades_closed": len(closed),
+            "win_rate": win_rate, "profit_factor": profit_factor,
+            "avg_net": avg_net, "cum_net": cum_net,
+            "max_drawdown": max_drawdown, "open_count": open_count}
+
+
+# ---------------------------------------------------------------------------
 # 理论曲线懒算 + 缓存（spec §5.4）
 # ---------------------------------------------------------------------------
 

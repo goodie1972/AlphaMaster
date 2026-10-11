@@ -1586,6 +1586,40 @@ def api_ledger_export(watch_id: str, days: int = 30, sha: str | None = None):
         return _ledger_fail("export", exc)
 
 
+@app.get("/api/ledger/trades")
+def api_ledger_trades(watch_id: str, days: int = 30, source: str = "live",
+                      sha: str | None = None) -> dict[str, Any]:
+    """成交视图：从逐 bar 行序列切出的成对进出场交易列表 + 交易口径汇总（task C1 §2）。
+
+    source="live" 实盘通道（账本逐根记录）；source="theo" 回放通道（同计算链对
+    完整历史的重算序列，界面须标注「回放」）。成交价=信号 bar 收盘价，收益数学
+    唯一实现：行序列出自 LS.derive_rows，交易切分出自 LS.derive_trades。
+    theo 不可用返回 200 + {"error", "source":"theo"}（与 spec §6 同款不 500）。
+    """
+    try:
+        cost_rate = _ledger_cost_rate()
+        scope = _ledger_scope(watch_id, days, sha)
+        if source == "theo":
+            theo_rows, reason = _ledger_theo_rows(scope, cost_rate)
+            if reason:
+                return {"error": reason, "source": "theo"}
+            rows = theo_rows
+        else:
+            rows = LS.derive_rows(scope["seg"], tf=scope["timeframe"], cost_rate=cost_rate)
+        trades = LS.derive_trades(rows, cost_rate)
+        return {
+            "watch_id": scope["watch_id"],
+            "sha": scope["sha"],
+            "source": source,
+            "days": days,
+            "cost_rate": cost_rate,
+            "stats": LS.trade_stats(trades),
+            "trades": trades,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return _ledger_fail("trades", exc)
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")

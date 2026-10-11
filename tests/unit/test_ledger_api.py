@@ -348,3 +348,78 @@ def test_export_unknown_watch_is_200_json_error(tmp_path, monkeypatch):
     monkeypatch.setattr(LL, "LEDGER_DIR", tmp_path)
     r = client.get("/api/ledger/export", params={"watch_id": "nope", "days": 1})
     assert r.status_code == 200 and "error" in r.json()
+
+
+# ── /api/ledger/trades（task C1：成交视图 实盘+回放 双通道）──────────
+def test_trades_endpoint_live(tmp_path, monkeypatch):
+    monkeypatch.setattr(LL, "LEDGER_DIR", tmp_path)
+    monkeypatch.setattr("web.app.load_settings",
+                        lambda: {"bt_commission_pct": 0.03, "bt_slippage_pct": 0.03})
+    # 平→多→多→平：一笔 closed；末行恒 missing
+    _write(tmp_path, [_rec(0, pos=0.0, close=100.0),
+                      _rec(3600, pos=1.0, close=100.0),
+                      _rec(7200, pos=1.0, close=102.0),
+                      _rec(10800, pos=0.0, close=102.0)])
+    body = client.get("/api/ledger/trades",
+                      params={"watch_id": "okx_BTCUSDT_1h", "days": 1,
+                              "source": "live"}).json()
+    assert body["source"] == "live" and body["watch_id"] == "okx_BTCUSDT_1h"
+    assert body["sha"] == SHA and body["days"] == 1
+    assert body["cost_rate"] == pytest.approx(0.0006)
+    trades = body["trades"]
+    assert len(trades) == 1 and trades[0]["status"] == "closed"
+    assert trades[0]["direction"] == "LONG"
+    assert trades[0]["entry_ts"] == 3600 and trades[0]["exit_ts"] == 10800
+    c = 0.0006
+    expect_net = 1.0 * (102.0 / 100.0 - 1.0) + 1.0 * (102.0 / 102.0 - 1.0) - 2.0 * c
+    assert trades[0]["net"] == pytest.approx(expect_net)
+    st = body["stats"]
+    assert st["trades_total"] == 1 and st["trades_closed"] == 1 and st["open_count"] == 0
+    assert st["win_rate"] == pytest.approx(1.0)
+
+
+def test_trades_endpoint_theo_chain_and_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(LL, "LEDGER_DIR", tmp_path)
+    monkeypatch.setattr("web.app.load_settings",
+                        lambda: {"bt_commission_pct": 0.03, "bt_slippage_pct": 0.03})
+    LL.ensure_strategy_index(FORMULA, "best_BTCUSDT_1h.json", "v1", ledger_dir=tmp_path)
+    _write(tmp_path, [_rec(i * 3600, pos=1.0, close=100.0 + i) for i in range(3)])
+    # 假重算：回放序列自带一笔 进→加→平（行字段与 derive_rows 同形状）
+    c = 0.0006
+    theo = [{"bar_ts": 0, "close": 100.0, "position": 0.0,
+             "ret": 1.0 / 100.0, "turnover": 1.0, "pnl": -1.0 * c, "missing": False},
+            {"bar_ts": 3600, "close": 101.0, "position": 1.0,
+             "ret": 1.0 / 101.0, "turnover": 1.0,
+             "pnl": 1.0 * (1.0 / 101.0) - 1.0 * c, "missing": False},
+            {"bar_ts": 7200, "close": 102.0, "position": 0.0,
+             "ret": None, "turnover": None, "pnl": None, "missing": True}]
+    monkeypatch.setattr(LS, "recompute_theo", lambda *a, **k: (theo, None))
+    body = client.get("/api/ledger/trades",
+                      params={"watch_id": "okx_BTCUSDT_1h", "days": 1,
+                              "source": "theo"}).json()
+    assert "error" not in body and body["source"] == "theo"
+    assert len(body["trades"]) == 1
+    assert body["trades"][0]["direction"] == "LONG"
+    assert body["trades"][0]["status"] == "closed"
+    assert sum(t["net"] for t in body["trades"]) == pytest.approx(
+        sum(r["pnl"] for r in theo if not r["missing"]))   # 恒等式（API 层透传）
+    # theo 失败 → 200 + {"error", "source":"theo"}，不影响 live 路
+    monkeypatch.setattr(LS, "recompute_theo", lambda *a, **k: ([], "test: 源不可用"))
+    bad = client.get("/api/ledger/trades",
+                    params={"watch_id": "okx_BTCUSDT_1h", "days": 1,
+                            "source": "theo"}).json()
+    assert bad.get("error") == "test: 源不可用" and bad["source"] == "theo"
+    live = client.get("/api/ledger/trades",
+                      params={"watch_id": "okx_BTCUSDT_1h", "days": 1,
+                              "source": "live"}).json()
+    assert "error" not in live and live["source"] == "live"
+
+
+def test_trades_endpoint_bad_params_are_200_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(LL, "LEDGER_DIR", tmp_path)
+    _write(tmp_path, [_rec(0)])
+    r = client.get("/api/ledger/trades", params={"watch_id": "a/../b", "days": 1})
+    assert r.status_code == 200 and "error" in r.json()
+    r = client.get("/api/ledger/trades",
+                   params={"watch_id": "okx_BTCUSDT_1h", "days": 99999})
+    assert r.status_code == 200 and "days" in r.json().get("error", "")
