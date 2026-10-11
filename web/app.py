@@ -21,6 +21,20 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+
+def _git_build() -> str:
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=str(ROOT),
+            capture_output=True, text=True, timeout=3).stdout.strip()
+        return out if out.isalnum() and 4 <= len(out) <= 40 else "dev"
+    except Exception:  # noqa: BLE001
+        return "dev"
+
+
+_AM_BUILD = _git_build()
+
 from data_pipeline.parquet_manager import inspect_parquet_file
 from model_core.config import ModelConfig
 from web.file_dialog import pick_parquet_file, pick_strategy_file
@@ -1622,7 +1636,13 @@ def api_ledger_trades(watch_id: str, days: int = 30, source: str = "live",
 
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+    # no-store：index.html 被浏览器启发式缓存时，普通刷新/重启浏览器都会继续
+    # 加载旧 app.js（?v= 在旧 HTML 里），表现为"服务端已更新但界面永远旧版"。
+    # X-AM-Build：一条 curl 即可证明连的是哪个构建（60bf89c 审查周期产物）。
+    return FileResponse(
+        STATIC_DIR / "index.html",
+        headers={"Cache-Control": "no-store", "X-AM-Build": _AM_BUILD},
+    )
 
 
 
