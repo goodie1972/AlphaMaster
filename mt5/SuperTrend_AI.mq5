@@ -18,8 +18,8 @@
 #property copyright "Ported for personal use"
 #property version   "1.00"
 #property indicator_chart_window
-#property indicator_buffers 4
-#property indicator_plots   2
+#property indicator_buffers 6
+#property indicator_plots   4
 
 //--- plot 0: Trailing Stop (teal up / red down, gap on flip)
 #property indicator_label1  "Trailing Stop"
@@ -31,6 +31,16 @@
 #property indicator_type2   DRAW_COLOR_LINE
 #property indicator_color2  clrRed,clrTeal
 #property indicator_width2  1
+//--- plot 2: Up signal arrow (color editable in the Colors tab)
+#property indicator_label3  "Up Arrow"
+#property indicator_type3   DRAW_ARROW
+#property indicator_color3  C'0,100,100'
+#property indicator_width3  2
+//--- plot 3: Down signal arrow (color editable in the Colors tab)
+#property indicator_label4  "Down Arrow"
+#property indicator_type4   DRAW_ARROW
+#property indicator_color4  C'180,0,0'
+#property indicator_width4  2
 
 enum ENUM_FROM_CLUSTER
   {
@@ -52,17 +62,28 @@ input int    InpMaxData    = 10000; // Historical Bars Calculation
 input group "Style"
 input bool   InpShowSignals= true;  // Show Signals
 input bool   InpShowAMA    = true;  // Show AMA
+input group "Signal Markers"
+input color  InpTextUpColor  = clrTeal;  // Up Number Color
+input color  InpTextDnColor  = clrRed;   // Down Number Color
+input string InpSigFont      = "Arial";  // Number Font
+input int    InpSigFontSize  = 8;        // Number Font Size
+input bool   InpSigBold      = false;    // Number Bold
+input bool   InpSigUnderline = true;     // Number Underline
+input double InpOffsetATR    = 0.5;      // Marker Offset (ATR x)
 
 double BufTS[];
 double BufTSColor[];
 double BufAMA[];
 double BufAMAColor[];
+double BufUpArrow[];
+double BufDnArrow[];
 
 //--- signal event collectors
 int    sigBar[];
 int    sigDir[];
 int    sigText[];
 double sigPrice[];
+double sigLine[];
 
 #define NA EMPTY_VALUE
 #define SIG_PREFIX "STAI_"
@@ -202,10 +223,14 @@ int OnInit()
    SetIndexBuffer(1,BufTSColor,INDICATOR_COLOR_INDEX);
    SetIndexBuffer(2,BufAMA,INDICATOR_DATA);
    SetIndexBuffer(3,BufAMAColor,INDICATOR_COLOR_INDEX);
+   SetIndexBuffer(4,BufUpArrow,INDICATOR_DATA);
+   SetIndexBuffer(5,BufDnArrow,INDICATOR_DATA);
    ArraySetAsSeries(BufTS,false);
    ArraySetAsSeries(BufTSColor,false);
    ArraySetAsSeries(BufAMA,false);
    ArraySetAsSeries(BufAMAColor,false);
+   ArraySetAsSeries(BufUpArrow,false);
+   ArraySetAsSeries(BufDnArrow,false);
    PlotIndexSetInteger(0,PLOT_COLOR_INDEXES,2);
    PlotIndexSetInteger(0,PLOT_LINE_COLOR,0,clrRed);
    PlotIndexSetInteger(0,PLOT_LINE_COLOR,1,clrTeal);
@@ -214,7 +239,16 @@ int OnInit()
    PlotIndexSetInteger(1,PLOT_LINE_COLOR,1,clrTeal);
    PlotIndexSetDouble(0,PLOT_EMPTY_VALUE,EMPTY_VALUE);
    PlotIndexSetDouble(1,PLOT_EMPTY_VALUE,EMPTY_VALUE);
+   PlotIndexSetInteger(2,PLOT_ARROW,233);
+   PlotIndexSetInteger(3,PLOT_ARROW,234);
+   PlotIndexSetDouble(2,PLOT_EMPTY_VALUE,EMPTY_VALUE);
+   PlotIndexSetDouble(3,PLOT_EMPTY_VALUE,EMPTY_VALUE);
    if(!InpShowAMA) PlotIndexSetInteger(1,PLOT_DRAW_TYPE,DRAW_NONE);
+   if(!InpShowSignals)
+     {
+      PlotIndexSetInteger(2,PLOT_DRAW_TYPE,DRAW_NONE);
+      PlotIndexSetInteger(3,PLOT_DRAW_TYPE,DRAW_NONE);
+     }
    IndicatorSetString(INDICATOR_SHORTNAME,"SuperTrend AI");
    IndicatorSetInteger(INDICATOR_DIGITS,_Digits);
    return(INIT_SUCCEEDED);
@@ -232,19 +266,37 @@ void BuildSignals(const datetime &time[])
    if(!InpShowSignals) return;
    int total=ArraySize(sigBar);
    int start=(int)MathMax(0,total-500);
+   string font=InpSigBold?InpSigFont+" Bold":InpSigFont;
+   int hw=(int)(0.35*PeriodSeconds());
    for(int s=start;s<total;s++)
      {
       int i=sigBar[s];
-      string name=SIG_PREFIX+IntegerToString(i);
-      if(ObjectCreate(0,name,OBJ_TEXT,0,time[i],sigPrice[s]))
+      bool up=(sigDir[s]>0);
+      color textCol=up?InpTextUpColor:InpTextDnColor;
+      string tname=SIG_PREFIX+"T"+IntegerToString(i);
+      if(ObjectCreate(0,tname,OBJ_TEXT,0,time[i],sigPrice[s]))
         {
-         ObjectSetString(0,name,OBJPROP_TEXT,IntegerToString(sigText[s]));
-         ObjectSetInteger(0,name,OBJPROP_COLOR,(sigDir[s]>0)?clrTeal:clrRed);
-         ObjectSetInteger(0,name,OBJPROP_ANCHOR,(sigDir[s]>0)?ANCHOR_UPPER:ANCHOR_LOWER);
-         ObjectSetInteger(0,name,OBJPROP_FONTSIZE,8);
-         ObjectSetString(0,name,OBJPROP_FONT,"Arial");
-         ObjectSetInteger(0,name,OBJPROP_SELECTABLE,false);
-         ObjectSetInteger(0,name,OBJPROP_HIDDEN,true);
+         ObjectSetString(0,tname,OBJPROP_TEXT,IntegerToString(sigText[s]));
+         ObjectSetInteger(0,tname,OBJPROP_COLOR,textCol);
+         ObjectSetInteger(0,tname,OBJPROP_ANCHOR,up?ANCHOR_UPPER:ANCHOR_LOWER);
+         ObjectSetInteger(0,tname,OBJPROP_FONTSIZE,InpSigFontSize);
+         ObjectSetString(0,tname,OBJPROP_FONT,font);
+         ObjectSetInteger(0,tname,OBJPROP_SELECTABLE,false);
+         ObjectSetInteger(0,tname,OBJPROP_HIDDEN,true);
+        }
+      if(InpSigUnderline)
+        {
+         string uname=SIG_PREFIX+"U"+IntegerToString(i);
+         if(ObjectCreate(0,uname,OBJ_TREND,0,time[i]-hw,sigLine[s],time[i]+hw,sigLine[s]))
+           {
+            ObjectSetInteger(0,uname,OBJPROP_COLOR,textCol);
+            ObjectSetInteger(0,uname,OBJPROP_WIDTH,1);
+            ObjectSetInteger(0,uname,OBJPROP_STYLE,STYLE_SOLID);
+            ObjectSetInteger(0,uname,OBJPROP_RAY_LEFT,false);
+            ObjectSetInteger(0,uname,OBJPROP_RAY_RIGHT,false);
+            ObjectSetInteger(0,uname,OBJPROP_SELECTABLE,false);
+            ObjectSetInteger(0,uname,OBJPROP_HIDDEN,true);
+           }
         }
      }
    ChartRedraw(0);
@@ -340,13 +392,23 @@ int OnCalculate(const int rates_total,
       bool cr=CrossAt(close,amaArr,i,0,0);
       BufAMA[i]=cr?NA:perf_ama;
       BufAMAColor[i]=(!IsNa(perf_ama)&&close[i]>perf_ama)?1:0;
+      BufUpArrow[i]=EMPTY_VALUE;
+      BufDnArrow[i]=EMPTY_VALUE;
 
       if(i>0 && !IsNa(ts) && !IsNa(perf_idx) && os!=os1)
         {
          int dir=(os>os1)?1:-1;
+         double atrI=nz(atr[i],0.0);
+         double off=InpOffsetATR*atrI;
+         double base=(dir>0)?low[i]:high[i];
+         double out=(dir>0)?-1.0:1.0;
+         double pArrow=base+out*off;
+         double pText =base+out*2.0*off;
+         double pLine =pText-0.3*off;
+         if(dir>0) BufUpArrow[i]=pArrow; else BufDnArrow[i]=pArrow;
          int sc=ArraySize(sigBar);
-         ArrayResize(sigBar,sc+1); ArrayResize(sigDir,sc+1); ArrayResize(sigText,sc+1); ArrayResize(sigPrice,sc+1);
-         sigBar[sc]=i; sigDir[sc]=dir; sigText[sc]=(int)(perf_idx*10); sigPrice[sc]=ts;
+         ArrayResize(sigBar,sc+1); ArrayResize(sigDir,sc+1); ArrayResize(sigText,sc+1); ArrayResize(sigPrice,sc+1); ArrayResize(sigLine,sc+1);
+         sigBar[sc]=i; sigDir[sc]=dir; sigText[sc]=(int)(perf_idx*10); sigPrice[sc]=pText; sigLine[sc]=pLine;
         }
      }
 
