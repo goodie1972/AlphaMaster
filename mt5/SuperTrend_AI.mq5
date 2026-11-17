@@ -267,7 +267,7 @@ void BuildSignals(const datetime &time[])
    int total=ArraySize(sigBar);
    int start=(int)MathMax(0,total-500);
    string font=InpSigBold?InpSigFont+" Bold":InpSigFont;
-   int hw=(int)(0.35*PeriodSeconds());
+   int hw=(int)(0.15*PeriodSeconds());
    for(int s=start;s<total;s++)
      {
       int i=sigBar[s];
@@ -404,7 +404,7 @@ int OnCalculate(const int rates_total,
          double out=(dir>0)?-1.0:1.0;
          double pArrow=base+out*off;
          double pText =base+out*2.0*off;
-         double pLine =pText-0.3*off;
+         double pLine =pText-0.25*off;
          if(dir>0) BufUpArrow[i]=pArrow; else BufDnArrow[i]=pArrow;
          int sc=ArraySize(sigBar);
          ArrayResize(sigBar,sc+1); ArrayResize(sigDir,sc+1); ArrayResize(sigText,sc+1); ArrayResize(sigPrice,sc+1); ArrayResize(sigLine,sc+1);
