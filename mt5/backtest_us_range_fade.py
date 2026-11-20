@@ -36,6 +36,12 @@ class Params:
     rr: float = 2.0
     adx_max: float | None = None
     cost_rate: float = 0.0003
+    # 研究旋钮（默认值 = 原设计行为）
+    short_only: bool = False          # 只做空（多头回归不标记不开仓）
+    min_wait_bars: int = 1            # 标记→回归最少等待棒数，不足按挡处理并作废该轨
+    min_range: float = 0.0            # 参照区间最小宽度（USD），不足当日不交易
+    sl_buffer: float = 0.0            # SL 在极值外再加 sl_buffer×参照区间宽度
+    entry_cutoff: int | None = None   # 回归棒服务器小时 >= 该值 → 挡 + 作废该轨
 
 
 def ref_eligible(ref: dict, p: Params) -> bool:
@@ -89,6 +95,9 @@ def simulate_day(ref: dict, m5_bars: list[dict], adx_by_time: dict, p: Params) -
     if not ref_eligible(ref, p):
         return []
     upper, lower = ref["high"], ref["low"]
+    rng = upper - lower
+    if rng < p.min_range:
+        return []
     start = ref["time"] + _WINDOW_START
     end = ref["time"] + _WINDOW_END
     bars = sorted((b for b in m5_bars if start <= b["time"] < end), key=lambda b: b["time"])
@@ -113,6 +122,8 @@ def simulate_day(ref: dict, m5_bars: list[dict], adx_by_time: dict, p: Params) -
 
         entered = False
         for d in ("short", "long"):
+            if p.short_only and d == "long":
+                continue
             mk = marks[d]
             if mk is None:
                 continue
@@ -129,8 +140,16 @@ def simulate_day(ref: dict, m5_bars: list[dict], adx_by_time: dict, p: Params) -
             if p.adx_max is not None and (adx is None or adx >= p.adx_max):
                 consumed[d] = True
                 continue
+            hour = datetime.fromtimestamp(b["time"], tz=timezone.utc).hour
+            if p.entry_cutoff is not None and hour >= p.entry_cutoff:
+                consumed[d] = True
+                continue
+            wait = (b["time"] - mk["mark_time"]) // 300
+            if wait < p.min_wait_bars:
+                consumed[d] = True
+                continue
             entry = b["close"]
-            sl = mk["extreme"]
+            sl = mk["extreme"] + p.sl_buffer * rng if d == "short" else mk["extreme"] - p.sl_buffer * rng
             risk = sl - entry if d == "short" else entry - sl
             if risk <= 0:
                 consumed[d] = True
@@ -153,7 +172,7 @@ def simulate_day(ref: dict, m5_bars: list[dict], adx_by_time: dict, p: Params) -
 
         if not consumed["short"] and marks["short"] is None and b["close"] > upper:
             marks["short"] = {"extreme": b["high"], "mark_time": b["time"]}
-        if not consumed["long"] and marks["long"] is None and b["close"] < lower:
+        if not p.short_only and not consumed["long"] and marks["long"] is None and b["close"] < lower:
             marks["long"] = {"extreme": b["low"], "mark_time": b["time"]}
 
     return trades

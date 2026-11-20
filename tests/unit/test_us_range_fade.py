@@ -364,6 +364,93 @@ def test_summarize_empty():
     assert s["profit_factor"] is None
 
 
+# ---------- 研究旋钮（默认值不改变原行为） ----------
+
+def test_short_only_skips_long_rail():
+    ov = {
+        (20, 0): (112.5, 114.0, 112.0, 113.0),
+        (20, 5): (113.0, 113.5, 110.5, 111.0),   # 空@111 SL114 TP105
+        (20, 10): (110.0, 110.5, 97.0, 97.5),    # TP@105；收盘<98
+        (20, 15): (97.5, 98.0, 96.0, 97.0),      # 跌破下轨
+        (20, 20): (97.0, 99.5, 96.5, 99.0),      # 回归 → 默认会做多
+        (20, 25): (99.0, 106.0, 98.5, 105.5),
+    }
+    p = urf.Params(short_only=True)
+    trades = urf.simulate_day(REF, m5_window(0, ov), {}, p)
+    assert len(trades) == 1
+    assert trades[0]["direction"] == "short"
+    # 纯多头数据 → 无交易
+    long_ov = {
+        (20, 0): (97.5, 98.0, 96.0, 97.0),
+        (20, 5): (97.0, 97.2, 95.0, 96.5),
+        (20, 10): (96.5, 99.5, 96.0, 99.0),
+    }
+    assert urf.simulate_day(REF, m5_window(0, long_ov), {}, p) == []
+
+
+def test_min_wait_bars_blocks_fast_return_and_consumes():
+    ov = {
+        (20, 0): (112.5, 114.0, 112.0, 113.0),   # 标记
+        (20, 5): (113.0, 113.5, 112.5, 113.0),   # 仍轨上
+        (20, 10): (113.0, 113.5, 110.5, 111.0),  # 回归 wait=2
+        (20, 15): (111.0, 111.5, 110.5, 111.0),  # 再回归也不得开仓（轨已作废）
+    }
+    p = urf.Params(min_wait_bars=3)
+    assert urf.simulate_day(REF, m5_window(0, ov), {}, p) == []
+    p2 = urf.Params(min_wait_bars=2)
+    trades = urf.simulate_day(REF, m5_window(0, ov), {}, p2)
+    assert len(trades) == 1
+    assert trades[0]["entry_time"] == ts(20, 10)
+
+
+def test_entry_cutoff_blocks_late_return():
+    ov = {
+        (21, 55): (112.5, 114.0, 112.0, 113.0),  # 标记
+        (22, 0): (113.0, 113.5, 110.5, 111.0),   # 回归发生在 22:00
+    }
+    p = urf.Params(entry_cutoff=22)
+    assert urf.simulate_day(REF, m5_window(0, ov), {}, p) == []
+    trades = urf.simulate_day(REF, m5_window(0, ov), {}, P)
+    assert len(trades) == 1
+    assert trades[0]["entry_time"] == ts(22, 0)
+    p2 = urf.Params(entry_cutoff=23)
+    assert len(urf.simulate_day(REF, m5_window(0, ov), {}, p2)) == 1
+
+
+def test_min_range_filters_narrow_ref():
+    ov = {
+        (20, 0): (112.5, 114.0, 112.0, 113.0),
+        (20, 5): (113.0, 113.5, 110.5, 111.0),
+    }
+    # REF 区间=14
+    assert urf.simulate_day(REF, m5_window(0, ov), {}, urf.Params(min_range=15.0)) == []
+    assert len(urf.simulate_day(REF, m5_window(0, ov), {}, urf.Params(min_range=14.0))) == 1
+
+
+def test_sl_buffer_widens_stop_by_range_fraction():
+    ov = {
+        (20, 0): (112.5, 114.0, 112.0, 113.0),
+        (20, 5): (113.0, 115.0, 112.8, 114.0),   # 极值 115
+        (20, 10): (114.0, 114.5, 110.5, 111.0),  # 空@111
+    }
+    p = urf.Params(sl_buffer=0.1)  # REF 区间 14 → 缓冲 1.4
+    trades = urf.simulate_day(REF, m5_window(0, ov), {}, p)
+    assert len(trades) == 1
+    t = trades[0]
+    assert t["sl"] == pytest.approx(116.4)
+    assert t["risk_dist"] == pytest.approx(5.4)
+    assert t["tp"] == pytest.approx(111.0 - 2 * 5.4)
+    # 多头镜像
+    long_ov = {
+        (20, 0): (97.5, 98.0, 96.0, 97.0),
+        (20, 5): (97.0, 97.2, 95.0, 96.5),       # 极值 95
+        (20, 10): (96.5, 99.5, 96.0, 99.0),      # 多@99
+    }
+    lt = urf.simulate_day(REF, m5_window(0, long_ov), {}, p)
+    assert lt[0]["sl"] == pytest.approx(93.6)
+    assert lt[0]["tp"] == pytest.approx(99.0 + 2 * 5.4)
+
+
 def test_run_backtest_day_reset_and_ref_hour_filter():
     def day_ov(day):
         return {
