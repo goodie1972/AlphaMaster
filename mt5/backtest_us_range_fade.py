@@ -255,3 +255,162 @@ def run_backtest(ref_bars: list[dict], m5_bars: list[dict], adx_by_time: dict,
         "by_year": {y: summarize(ts_, initial_equity, risk_per_trade)
                     for y, ts_ in sorted(by_year.items())},
     }
+
+
+# ---------- MT5 数据拉取 / CLI ----------
+
+def _rates_to_bars(rates) -> list[dict]:
+    return [{"time": int(r["time"]), "open": float(r["open"]), "high": float(r["high"]),
+             "low": float(r["low"]), "close": float(r["close"])} for r in rates]
+
+
+def fetch_data(symbol: str = "XAUUSD", years: float = 2.0) -> dict:
+    """分块 copy_rates_range 拉 M5（单次请求超终端 max-bars 会报 Invalid params），
+    H4 用 from_pos。入参按本机北京时刻解释：服务器墙钟 +5h（夏）/+6h（冬），
+    两端各留 1 天余量，再按 epoch 过滤回服务器区间。"""
+    import MetaTrader5 as mt5
+    from datetime import timedelta
+    if not mt5.initialize():
+        raise RuntimeError(f"MT5 initialize 失败: {mt5.last_error()}")
+    try:
+        if not mt5.symbol_select(symbol, True):
+            raise RuntimeError(f"品种 {symbol} 不可用: {mt5.last_error()}")
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None or tick.time == 0:
+            raise RuntimeError(f"无 tick: {mt5.last_error()}")
+        now_srv = int(tick.time)
+        start_srv = now_srv - int(years * 365) * 86400
+        lo = datetime.utcfromtimestamp(start_srv) + timedelta(hours=5, days=-1)
+        hi = datetime.utcfromtimestamp(now_srv) + timedelta(hours=6, days=1)
+        seen: dict = {}
+        cur = lo
+        while cur < hi:
+            nxt = min(cur + timedelta(days=85), hi)
+            r = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_M5, cur, nxt)
+            got = 0 if r is None else len(r)
+            if r is not None:
+                for row in r:
+                    t = int(row["time"])
+                    if start_srv <= t and t + 300 <= now_srv:  # 只要已收盘 bar
+                        seen[t] = row
+            print(f"  chunk {cur:%Y-%m-%d}..{nxt:%Y-%m-%d} -> {got} 根")
+            cur = nxt
+        h4 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H4, 1, 4000)
+        if h4 is None or len(h4) == 0:
+            raise RuntimeError(f"H4 拉取为空: {mt5.last_error()}")
+    finally:
+        mt5.shutdown()
+    m5 = [_rates_to_bars([seen[t]])[0] for t in sorted(seen)]
+    if not m5:
+        raise RuntimeError("M5 合并后为空")
+    return {"symbol": symbol, "m5": m5, "h4": _rates_to_bars(h4),
+            "fetched_at": int(datetime.now(timezone.utc).timestamp()),
+            "requested_start": start_srv, "requested_end": now_srv}
+
+
+def _srv(ts_: int) -> str:
+    return datetime.fromtimestamp(ts_, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+def _cache_path() -> "pathlib.Path":
+    import pathlib
+    return pathlib.Path(__file__).resolve().parent.parent / "tmp" / "urf_cache.json"
+
+
+def _load_cache() -> dict:
+    import json
+    path = _cache_path()
+    if not path.exists():
+        raise SystemExit("无数据缓存，先跑: python mt5/backtest_us_range_fade.py fetch")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _fmt_pct(v) -> str:
+    return "—" if v is None else f"{v * 100:.2f}%"
+
+
+def _fmt_num(v, nd: int = 2) -> str:
+    return "—" if v is None else f"{v:.{nd}f}"
+
+
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+    import json
+
+    ap = argparse.ArgumentParser(description="US_Range_Fade 回测")
+    ap.add_argument("cmd", choices=["fetch", "backtest"])
+    ap.add_argument("--symbol", default="XAUUSD")
+    ap.add_argument("--years", type=float, default=2.0)
+    ap.add_argument("--equity", type=float, default=5000.0)
+    ap.add_argument("--risk", type=float, default=0.01)
+    ap.add_argument("--cost-rate", type=float, default=0.0003,
+                    help="单边成本率（默认=台账口径 bt_commission+bt_slippage=0.0003）")
+    args = ap.parse_args(argv)
+
+    if args.cmd == "fetch":
+        data = fetch_data(args.symbol, args.years)
+        path = _cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        m5, h4 = data["m5"], data["h4"]
+        refs = [b for b in h4 if datetime.fromtimestamp(b["time"], tz=timezone.utc).hour == REF_HOUR]
+        print(f"品种 {data['symbol']} · 缓存 {path}")
+        print(f"请求区间（服务器钟）: {_srv(data['requested_start'])} → {_srv(data['requested_end'])}")
+        print(f"M5: {len(m5)} 根 · {_srv(m5[0]['time'])} → {_srv(m5[-1]['time'])}")
+        print(f"H4: {len(h4)} 根 · {_srv(h4[0]['time'])} → {_srv(h4[-1]['time'])}")
+        print(f"16:00 参照棒: {len(refs)} 根")
+        return
+
+    data = _load_cache()
+    m5, h4 = data["m5"], data["h4"]
+    print(f"数据: {data['symbol']} M5 {len(m5)} 根 {_srv(m5[0]['time'])} → {_srv(m5[-1]['time'])}")
+    adx_vals = wilder_adx(m5, 14)
+    adx_by_time = {b["time"]: v for b, v in zip(m5, adx_vals)}
+    variants = [("off", None), ("<20", 20.0), ("<25", 25.0), ("<30", 30.0)]
+    report = {"symbol": data["symbol"],
+              "data_range": [_srv(m5[0]["time"]), _srv(m5[-1]["time"])],
+              "m5_bars": len(m5), "initial_equity": args.equity,
+              "risk_per_trade": args.risk, "cost_rate": args.cost_rate,
+              "variants": {}}
+    print(f"成本率（单边）: {args.cost_rate}")
+    print(f"\n{'ADX':<6}{'笔数':>6}{'胜率':>9}{'PF':>8}{'净收益':>10}{'MDD':>9}{'终值$':>11}")
+    for name, thr in variants:
+        p = Params(adx_max=thr, cost_rate=args.cost_rate)
+        res = run_backtest(h4, m5, adx_by_time, p, args.equity, args.risk)
+        s = res["summary"]
+        reasons = {}
+        for t in res["trades"]:
+            reasons[t["exit_reason"]] = reasons.get(t["exit_reason"], 0) + 1
+        risks = [t["risk_dist"] for t in res["trades"]]
+        report["variants"][name] = {
+            "summary": {k: v for k, v in s.items() if k != "equity_curve"},
+            "by_year": {y: {k: v for k, v in ys.items() if k != "equity_curve"}
+                        for y, ys in res["by_year"].items()},
+            "exit_reasons": reasons,
+            "avg_risk_dist": sum(risks) / len(risks) if risks else None,
+            "trades": res["trades"],
+        }
+        print(f"{name:<6}{s['n_trades']:>6}{_fmt_pct(s['win_rate']):>9}"
+              f"{_fmt_num(s['profit_factor']):>8}{_fmt_pct(s['total_return']):>10}"
+              f"{_fmt_pct(s['max_drawdown']):>9}{s['final_equity']:>11.2f}")
+    print("\n分年（净收益 / 笔数 / 胜率 / MDD）:")
+    for name, _ in variants:
+        v = report["variants"][name]
+        parts = [f"{y}: {_fmt_pct(ys['total_return'])} / {ys['n_trades']}笔 / "
+                 f"{_fmt_pct(ys['win_rate'])} / {_fmt_pct(ys['max_drawdown'])}"
+                 for y, ys in v["by_year"].items()]
+        print(f"  ADX {name:<4} " + " · ".join(parts))
+    print("\n出场构成（tp/sl/eod）与平均止损距离（美元/盎司）:")
+    for name, _ in variants:
+        v = report["variants"][name]
+        print(f"  ADX {name:<4} {v['exit_reasons']} · 平均SL距离 {_fmt_num(v['avg_risk_dist'])}")
+    out = _cache_path().parent / f"urf_report_cost{args.cost_rate:g}.json"
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=1)
+    print(f"\n报告: {out}")
+
+
+if __name__ == "__main__":
+    main()
