@@ -38,10 +38,15 @@ class Params:
     cost_rate: float = 0.0003
     # 研究旋钮（默认值 = 原设计行为）
     short_only: bool = False          # 只做空（多头回归不标记不开仓）
+    dir_mode: str = "both"            # both | short | long | counter_ref（参照棒反向）
     min_wait_bars: int = 1            # 标记→回归最少等待棒数，不足按挡处理并作废该轨
     min_range: float = 0.0            # 参照区间最小宽度（USD），不足当日不交易
     sl_buffer: float = 0.0            # SL 在极值外再加 sl_buffer×参照区间宽度
     entry_cutoff: int | None = None   # 回归棒服务器小时 >= 该值 → 挡 + 作废该轨
+    ref_hour: int = REF_HOUR          # 参照棒起始小时（时段可切换：16=美盘, 其它=欧盘候选）
+    h4_adx_min: float | None = None   # 参照棒收盘时 H4 ADX(14) 下限（< 挡当日）
+    h4_adx_max: float | None = None   # 参照棒收盘时 H4 ADX(14) 上限（>= 挡当日）
+    min_range_pct: float = 0.0        # 参照区间宽度下限（占参照棒收盘价比）
 
 
 def ref_eligible(ref: dict, p: Params) -> bool:
@@ -90,13 +95,28 @@ def _close_trade(pos: dict, exit_time: int, exit_price: float, reason: str, p: P
     }
 
 
+def allowed_dirs(ref: dict, p: Params) -> tuple[bool, bool]:
+    """返回 (允许做空, 允许做多)。counter_ref：参照棒阳线只做空、阴线只做多。"""
+    mode = "short" if p.short_only else p.dir_mode
+    if mode == "short":
+        return True, False
+    if mode == "long":
+        return False, True
+    if mode == "counter_ref":
+        return (ref["close"] >= ref["open"]), (ref["close"] < ref["open"])
+    return True, True
+
+
 def simulate_day(ref: dict, m5_bars: list[dict], adx_by_time: dict, p: Params) -> list[dict]:
     """单日状态机。m5_bars 可含窗外棒（内部过滤）；adx_by_time: {bar_time: ADX|None}。"""
     if not ref_eligible(ref, p):
         return []
+    allow_short, allow_long = allowed_dirs(ref, p)
     upper, lower = ref["high"], ref["low"]
     rng = upper - lower
     if rng < p.min_range:
+        return []
+    if p.min_range_pct > 0 and rng < p.min_range_pct * ref["close"]:
         return []
     start = ref["time"] + _WINDOW_START
     end = ref["time"] + _WINDOW_END
@@ -122,7 +142,9 @@ def simulate_day(ref: dict, m5_bars: list[dict], adx_by_time: dict, p: Params) -
 
         entered = False
         for d in ("short", "long"):
-            if p.short_only and d == "long":
+            if d == "short" and not allow_short:
+                continue
+            if d == "long" and not allow_long:
                 continue
             mk = marks[d]
             if mk is None:
@@ -170,9 +192,9 @@ def simulate_day(ref: dict, m5_bars: list[dict], adx_by_time: dict, p: Params) -
         if entered:
             continue
 
-        if not consumed["short"] and marks["short"] is None and b["close"] > upper:
+        if allow_short and not consumed["short"] and marks["short"] is None and b["close"] > upper:
             marks["short"] = {"extreme": b["high"], "mark_time": b["time"]}
-        if not p.short_only and not consumed["long"] and marks["long"] is None and b["close"] < lower:
+        if allow_long and not consumed["long"] and marks["long"] is None and b["close"] < lower:
             marks["long"] = {"extreme": b["low"], "mark_time": b["time"]}
 
     return trades
@@ -256,10 +278,22 @@ def run_backtest(ref_bars: list[dict], m5_bars: list[dict], adx_by_time: dict,
                  risk_per_trade: float = 0.01) -> dict:
     m5_sorted = sorted(m5_bars, key=lambda b: b["time"])
     times = [b["time"] for b in m5_sorted]
+    # H4 ADX：整条 H4 序列上递推，取参照棒自身收盘时的值（= 窗口开盘时刻已知，无未来函数）
+    h4_sorted = sorted(ref_bars, key=lambda b: b["time"])
+    h4_adx_vals = wilder_adx(h4_sorted, 14)
+    h4_adx_by_time = {b["time"]: v for b, v in zip(h4_sorted, h4_adx_vals)}
     trades: list[dict] = []
-    for ref in sorted(ref_bars, key=lambda b: b["time"]):
-        if datetime.fromtimestamp(ref["time"], tz=timezone.utc).hour != REF_HOUR:
+    for ref in h4_sorted:
+        if datetime.fromtimestamp(ref["time"], tz=timezone.utc).hour != p.ref_hour:
             continue
+        if p.h4_adx_min is not None or p.h4_adx_max is not None:
+            ha = h4_adx_by_time.get(ref["time"])
+            if ha is None:
+                continue  # H4 ADX 缺值 → 保守挡当日
+            if p.h4_adx_min is not None and ha < p.h4_adx_min:
+                continue
+            if p.h4_adx_max is not None and ha >= p.h4_adx_max:
+                continue
         lo = bisect.bisect_left(times, ref["time"] + _WINDOW_START)
         hi = bisect.bisect_left(times, ref["time"] + _WINDOW_END)
         trades.extend(simulate_day(ref, m5_sorted[lo:hi], adx_by_time, p))

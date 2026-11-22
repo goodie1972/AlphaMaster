@@ -451,6 +451,113 @@ def test_sl_buffer_widens_stop_by_range_fraction():
     assert lt[0]["tp"] == pytest.approx(99.0 + 2 * 5.4)
 
 
+# ---------- H4 ADX 区间门 / 时段参数化 ----------
+
+def _h4_series(kind: str = "up", n: int = 31) -> list[dict]:
+    """从服务器 16:00 起每 4h 一根 H4；index 30 落在第5天 16:00，轨位固定 112/110。
+    kind="up" 单边上行（ADX 高）；kind="flat" 上下交替（ADX≈0）。"""
+    out = []
+    for i in range(n):
+        if kind == "up":
+            base = 100.0 + 0.35 * i
+            out.append(bar(ts(16) + i * 4 * 3600, base, base + 1.5, base - 0.5, base + 1.0))
+        else:
+            o = 110.0 if i % 2 == 0 else 111.0
+            c = 111.0 if i % 2 == 0 else 110.0
+            out.append(bar(ts(16) + i * 4 * 3600, o, 112.0, 110.0, c))
+    return out
+
+
+def _breakout_ov() -> dict:
+    return {
+        (20, 0): (112.5, 114.0, 112.0, 113.0),
+        (20, 5): (113.0, 113.5, 110.5, 111.0),   # 回归 → 空@111 SL114 TP105
+        (20, 10): (111.0, 111.5, 104.0, 104.5),  # TP@105
+    }
+
+
+def test_h4_adx_band_filters_day():
+    h4 = _h4_series("up")
+    adx = urf.wilder_adx(h4, 14)[-1]
+    assert adx > 30.0
+    m5 = m5_window(5, _breakout_ov())
+    assert len(urf.run_backtest(h4, m5, {}, urf.Params())["trades"]) == 1
+    # 强趋势 H4 序列 ADX 高 → 上限 30 挡掉当日
+    assert urf.run_backtest(h4, m5, {}, urf.Params(h4_adx_max=30.0))["trades"] == []
+    # 下限 20：ADX 高于下限 → 通过
+    assert len(urf.run_backtest(h4, m5, {}, urf.Params(h4_adx_min=20.0))["trades"]) == 1
+
+
+def test_h4_adx_min_blocks_flat_market():
+    h4 = _h4_series("flat")
+    adx = urf.wilder_adx(h4, 14)[-1]
+    assert adx < 20.0
+    m5 = m5_window(5, _breakout_ov())
+    assert len(urf.run_backtest(h4, m5, {}, urf.Params())["trades"]) == 1
+    assert urf.run_backtest(h4, m5, {}, urf.Params(h4_adx_min=20.0))["trades"] == []
+
+
+def test_ref_hour_param_selects_session():
+    """ref_hour=20 → 用 20:00 的 H4 棒做参照，窗口 00:00-04:00 次日。"""
+    ref16 = bar(ts(16), 100.0, 112.0, 98.0, 110.0)
+    ref20 = bar(ts(20), 100.0, 112.0, 98.0, 110.0)
+    ov = {
+        (0, 0): (112.5, 114.0, 112.0, 113.0),
+        (0, 5): (113.0, 113.5, 110.5, 111.0),
+        (0, 10): (111.0, 111.5, 104.0, 104.5),
+    }
+    m5 = []
+    t = ts(0, 0, 1)
+    for i in range(48):
+        h, m = (i * 5) // 60, (i * 5) % 60
+        o, hh, ll, c = ov.get((h, m), (100.0, 100.0, 100.0, 100.0))
+        m5.append(bar(t + i * 300, o, hh, ll, c))
+    res16 = urf.run_backtest([ref16, ref20], m5, {}, urf.Params(ref_hour=16))
+    assert len(res16["trades"]) == 0  # 16:00 参照的窗口是 20:00-24:00，无数据
+    res20 = urf.run_backtest([ref16, ref20], m5, {}, urf.Params(ref_hour=20))
+    assert len(res20["trades"]) == 1
+    assert res20["trades"][0]["entry_time"] == ts(0, 5, 1)
+
+
+def test_min_range_pct_relative_to_price():
+    ov = _breakout_ov()
+    # REF 区间 14 / 收盘 110 → 12.7%
+    assert urf.simulate_day(REF, m5_window(0, ov), {}, urf.Params(min_range_pct=0.10)) != []
+    assert urf.simulate_day(REF, m5_window(0, ov), {}, urf.Params(min_range_pct=0.15)) == []
+
+
+def test_dir_mode_counter_ref_follows_reference_bar():
+    """counter_ref：参照棒阳线→只做空；阴线→只做多。"""
+    long_ov = {
+        (20, 0): (97.5, 98.0, 96.0, 97.0),
+        (20, 5): (97.0, 97.2, 95.0, 96.5),
+        (20, 10): (96.5, 99.5, 96.0, 99.0),      # 回归 → 多@99
+    }
+    short_ov = {
+        (20, 0): (112.5, 114.0, 112.0, 113.0),
+        (20, 5): (113.0, 113.5, 110.5, 111.0),  # 回归 → 空@111
+    }
+    p = urf.Params(dir_mode="counter_ref")
+    # REF 阳线（close 110 > open 100）→ 只做空
+    assert urf.simulate_day(REF, m5_window(0, long_ov), {}, p) == []
+    assert len(urf.simulate_day(REF, m5_window(0, short_ov), {}, p)) == 1
+    # 阴线参照棒（open 110 close 100）→ 只做多
+    bear_ref = bar(ts(16), 110.0, 112.0, 98.0, 100.0)
+    assert urf.simulate_day(bear_ref, m5_window(0, short_ov), {}, p) == []
+    assert len(urf.simulate_day(bear_ref, m5_window(0, long_ov), {}, p)) == 1
+
+
+def test_dir_mode_short_only():
+    p = urf.Params(dir_mode="short")
+    long_ov = {
+        (20, 0): (97.5, 98.0, 96.0, 97.0),
+        (20, 5): (97.0, 97.2, 95.0, 96.5),
+        (20, 10): (96.5, 99.5, 96.0, 99.0),
+    }
+    assert urf.simulate_day(REF, m5_window(0, long_ov), {}, p) == []
+    assert len(urf.simulate_day(REF, m5_window(0, long_ov), {}, urf.Params())) == 1
+
+
 def test_run_backtest_day_reset_and_ref_hour_filter():
     def day_ov(day):
         return {
