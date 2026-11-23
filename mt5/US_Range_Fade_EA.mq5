@@ -1,30 +1,46 @@
 //+------------------------------------------------------------------+
-//| US_Range_Fade_EA.mq5 — 美盘 H4 区间 M5 假突破回归                    |
-//| 参照棒 = 每日服务器 16:00–20:00 H4；实体>=50%区间且居中(偏差<=25%)      |
-//| 上轨=H 下轨=L；M5 监控窗 20:00–24:00（服务器钟）                      |
-//| 收盘突破上轨→标记跟踪最高价；收盘回归上轨→做空，SL=最高价，TP=2R        |
-//| 下轨镜像做多。每轨每日一次；ADX 挡掉的回归同样作废该轨；                |
-//| 最多1笔持仓；24:00 强平；双触 SL/TP 由 broker tick 顺序决定            |
-//| 逻辑与 mt5/backtest_us_range_fade.py 逐条镜像（23 项单元测试锁定）     |
+//| US_Range_Fade_EA.mq5 — H4 区间 M5 假突破回归（美盘/欧盘可切）        |
+//| 参照棒 = 每日服务器 InpRefHour:00 起 H4；实体>=50%区间且居中(偏差<=25%)|
+//| 上轨=H 下轨=L；M5 监控窗 = 参照棒开盘 +4h ~ +8h（服务器钟）          |
+//| 收盘突破上轨→标记跟踪最高价；收盘回归上轨→做空，SL=最高价，TP=2R    |
+//| 下轨镜像做多。每轨每日一次；门挡掉的回归同样作废该轨；                |
+//| 最多1笔持仓；窗口末强平；双触 SL/TP 由 broker tick 顺序决定          |
+//| 逻辑与 mt5/backtest_us_range_fade.py 逐条镜像（34 项单元测试锁定）   |
+//| 默认参数 = 美盘推荐组：ref16 / H4 ADX 20-30 / 只做空 / 区间>=1%      |
 //+------------------------------------------------------------------+
 #property copyright "AlphaMaster"
-#property version   "1.00"
+#property version   "1.10"
 
 #include <Trade\Trade.mqh>
+
+enum EnumDirMode
+{
+   DIR_BOTH    = 0,   // 双向
+   DIR_SHORT   = 1,   // 只做空
+   DIR_LONG    = 2,   // 只做多
+   DIR_COUNTER = 3    // 参照棒反向（阳线只做空、阴线只做多）
+};
 
 input double InpRiskPercent = 1.0;    // 每笔风险%（按权益反算手数）
 input double InpBodyRatio   = 0.5;    // 参照棒实体/区间 下限
 input double InpCenterTol   = 0.25;   // 实体中点偏离区间中点 上限（×区间）
 input double InpRR          = 2.0;    // 止盈 = RR × 止损距离
-input bool   InpUseAdx      = true;   // ADX 过滤开关（回测结论见 .md）
-input int    InpAdxPeriod   = 14;     // ADX 周期（M5）
-input double InpAdxMax      = 25.0;   // ADX >= 此值挡单（入场棒取值）
-input int    InpRefHour     = 16;     // 参照 H4 开盘小时（服务器钟）
+input int    InpRefHour     = 16;     // 参照 H4 开盘小时（服务器钟）16=美盘 12=欧盘尾段
+input EnumDirMode InpDirMode = DIR_SHORT;  // 方向模式
+input bool   InpUseH4Adx    = true;   // H4 ADX 区间门 开关
+input int    InpAdxPeriod   = 14;     // ADX 周期（14，Wilder）
+input double InpH4AdxMin    = 20.0;   // H4 ADX 下限（< 挡当日）
+input double InpH4AdxMax    = 30.0;   // H4 ADX 上限（>= 挡当日）
+input double InpMinRange    = 0.0;    // 参照区间宽度下限（USD，0=关闭）
+input double InpMinRangePct = 1.0;    // 参照区间宽度下限（占参照棒收盘价 %，0=关闭）
+input bool   InpUseAdxM5    = false;  // M5 ADX 门 开关（回测未采用，默认关）
+input double InpAdxMax      = 25.0;   // M5 ADX >= 此值挡单（仅 InpUseAdxM5=true 时生效）
 input ulong  InpMagic       = 20261120;
 input ulong  InpDeviation   = 20;     // 市价单允许滑点（points）
 
 CTrade   g_trade;
 int      g_adx_handle = INVALID_HANDLE;
+int      g_h4_adx_handle = INVALID_HANDLE;
 datetime g_last_bar   = 0;
 int      g_day_key    = 0;
 datetime g_ref_time   = 0;
@@ -33,6 +49,8 @@ datetime g_win_end    = 0;
 bool     g_ref_loaded = false;
 bool     g_eligible   = false;
 double   g_upper = 0, g_lower = 0;
+bool     g_allow_short = true;
+bool     g_allow_long  = false;
 bool     g_consumed[2] = {false, false};   // 0=short 1=long
 bool     g_marked[2]   = {false, false};
 double   g_extreme[2]  = {0, 0};
@@ -48,6 +66,18 @@ int DayKey(datetime t)
    return st.year * 10000 + st.mon * 100 + st.day;
 }
 
+void SetDirs(double o, double c)
+{
+   switch(InpDirMode)
+   {
+      case DIR_BOTH:    g_allow_short = true;  g_allow_long = true;         break;
+      case DIR_SHORT:   g_allow_short = true;  g_allow_long = false;        break;
+      case DIR_LONG:    g_allow_short = false; g_allow_long = true;         break;
+      case DIR_COUNTER: g_allow_short = (c >= o); g_allow_long = (c < o);    break;
+      default:          g_allow_short = true;  g_allow_long = true;         break;
+   }
+}
+
 void ResetDay(datetime t)
 {
    g_day_key = DayKey(t);
@@ -58,6 +88,8 @@ void ResetDay(datetime t)
    g_win_end   = g_ref_time + 8 * 3600;
    g_ref_loaded = false;
    g_eligible   = false;
+   g_allow_short = (InpDirMode != DIR_LONG);
+   g_allow_long  = (InpDirMode != DIR_SHORT);
    for(int d = 0; d < 2; d++)
    {
       g_consumed[d] = false;
@@ -65,6 +97,17 @@ void ResetDay(datetime t)
       g_extreme[d]  = 0;
       g_mark_time[d]= 0;
    }
+}
+
+double H4AdxAt(datetime t)
+{
+   if(g_h4_adx_handle == INVALID_HANDLE) return -1;
+   int sh = iBarShift(_Symbol, PERIOD_H4, t, true);
+   if(sh < 0) return -1;
+   double buf[1];
+   if(CopyBuffer(g_h4_adx_handle, 0, sh, 1, buf) != 1) return -1;
+   if(!MathIsValidNumber(buf[0])) return -1;
+   return buf[0];
 }
 
 void LoadRef()
@@ -78,15 +121,24 @@ void LoadRef()
    g_ref_loaded = true;
    double rng = h - l;
    if(rng <= 0) { g_eligible = false; return; }
+   if(InpMinRange > 0 && rng < InpMinRange) { g_eligible = false; return; }
+   if(InpMinRangePct > 0 && rng < InpMinRangePct / 100.0 * c) { g_eligible = false; return; }
    double body = MathAbs(c - o);
    double dev  = MathAbs((o + c) / 2 - (h + l) / 2);
-   g_eligible = (body >= InpBodyRatio * rng && dev <= InpCenterTol * rng);
+   if(!(body >= InpBodyRatio * rng && dev <= InpCenterTol * rng)) { g_eligible = false; return; }
+   if(InpUseH4Adx)
+   {
+      double adx = H4AdxAt(g_ref_time);
+      if(adx < 0 || adx < InpH4AdxMin || adx >= InpH4AdxMax) { g_eligible = false; return; }
+   }
+   g_eligible = true;
    g_upper = h; g_lower = l;
+   SetDirs(o, c);
 }
 
 double AdxAt(int shift)
 {
-   if(!InpUseAdx) return -1;
+   if(!InpUseAdxM5) return -1;
    double buf[1];
    if(CopyBuffer(g_adx_handle, 0, shift, 1, buf) != 1) return -1;
    if(!MathIsValidNumber(buf[0])) return -1;
@@ -158,7 +210,7 @@ void CloseEOD()
       {
          g_trade.SetExpertMagicNumber(InpMagic);
          g_trade.PositionClose(ticket);
-         Print("US_Range_Fade: 24:00 强平 ticket=", ticket);
+         Print("US_Range_Fade: 窗口末强平 ticket=", ticket);
       }
    }
 }
@@ -168,6 +220,8 @@ void ProcessSignals(datetime bt, double h, double l, double c, double adx, bool 
 {
    for(int d = 0; d < 2; d++)
    {
+      if(d == 0 && !g_allow_short) continue;
+      if(d == 1 && !g_allow_long)  continue;
       if(!g_marked[d]) continue;
       bool returned;
       if(d == 0)
@@ -182,10 +236,10 @@ void ProcessSignals(datetime bt, double h, double l, double c, double adx, bool 
       }
       if(!returned) continue;
       g_marked[d] = false;
-      if(InpUseAdx && (adx < 0 || adx >= InpAdxMax))
+      if(InpUseAdxM5 && (adx < 0 || adx >= InpAdxMax))
       {
          g_consumed[d] = true;              // ADX 挡单 → 该轨当日作废
-         Print("US_Range_Fade: ADX=", adx, " 挡掉回归，轨道 ", d, " 当日作废");
+         Print("US_Range_Fade: M5 ADX=", adx, " 挡掉回归，轨道 ", d, " 当日作废");
          continue;
       }
       double entry = c, sl = g_extreme[d];
@@ -203,11 +257,11 @@ void ProcessSignals(datetime bt, double h, double l, double c, double adx, bool 
       }
       return;
    }
-   if(!g_consumed[0] && !g_marked[0] && c > g_upper)
+   if(g_allow_short && !g_consumed[0] && !g_marked[0] && c > g_upper)
    {
       g_marked[0] = true; g_extreme[0] = h; g_mark_time[0] = bt;
    }
-   if(!g_consumed[1] && !g_marked[1] && c < g_lower)
+   if(g_allow_long && !g_consumed[1] && !g_marked[1] && c < g_lower)
    {
       g_marked[1] = true; g_extreme[1] = l; g_mark_time[1] = bt;
    }
@@ -234,6 +288,12 @@ int OnInit()
    if(g_adx_handle == INVALID_HANDLE)
    {
       Print("US_Range_Fade: iADX 创建失败");
+      return INIT_FAILED;
+   }
+   g_h4_adx_handle = iADX(_Symbol, PERIOD_H4, InpAdxPeriod);
+   if(g_h4_adx_handle == INVALID_HANDLE)
+   {
+      Print("US_Range_Fade: iADX(H4) 创建失败");
       return INIT_FAILED;
    }
    g_trade.SetExpertMagicNumber(InpMagic);
@@ -272,13 +332,15 @@ int OnInit()
       g_holding = false;                    // 回放出的入场若已不在 → 不追溯补单
    g_last_bar = iTime(_Symbol, PERIOD_M5, 1);
    Print("US_Range_Fade: 初始化完成 day=", g_day_key,
-         " eligible=", g_eligible, " holding=", g_holding);
+         " eligible=", g_eligible, " holding=", g_holding,
+         " mode=", (int)InpDirMode, " ref_hour=", InpRefHour);
    return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason)
 {
    if(g_adx_handle != INVALID_HANDLE) IndicatorRelease(g_adx_handle);
+   if(g_h4_adx_handle != INVALID_HANDLE) IndicatorRelease(g_h4_adx_handle);
    Comment("");
 }
 
@@ -294,7 +356,7 @@ void OnTick()
          g_holding = false;                 // SL/TP 已被 broker 执行
       else if(t1 >= g_win_end)
       {
-         CloseEOD();                        // 23:55 收盘后强平
+         CloseEOD();                        // 窗口最后一根收盘后强平
          g_holding = false;
       }
       if(DayKey(t1) != g_day_key) ResetDay(t1);

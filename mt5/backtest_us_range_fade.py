@@ -348,7 +348,7 @@ def fetch_data(symbol: str = "XAUUSD", years: float = 2.0) -> dict:
                         seen[t] = row
             print(f"  chunk {cur:%Y-%m-%d}..{nxt:%Y-%m-%d} -> {got} 根")
             cur = nxt
-        h4 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H4, 1, 4000)
+        h4 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H4, 1, 7000)
         if h4 is None or len(h4) == 0:
             raise RuntimeError(f"H4 拉取为空: {mt5.last_error()}")
     finally:
@@ -394,7 +394,7 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="US_Range_Fade 回测")
     ap.add_argument("cmd", choices=["fetch", "backtest"])
     ap.add_argument("--symbol", default="XAUUSD")
-    ap.add_argument("--years", type=float, default=2.0)
+    ap.add_argument("--years", type=float, default=3.0)
     ap.add_argument("--equity", type=float, default=5000.0)
     ap.add_argument("--risk", type=float, default=0.01)
     ap.add_argument("--cost-rate", type=float, default=0.0003,
